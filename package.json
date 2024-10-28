@@ -91,5 +91,8 @@
       "@types/uuencode@0.0.3": "patches/@types__uuencode@0.0.3.patch",
       "@langchain/core@0.3.3": "patches/@langchain__core@0.3.3.patch"
     }
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
   }
 }
