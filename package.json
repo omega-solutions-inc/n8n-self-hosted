@@ -93,7 +93,6 @@
     }
   },
   "dependencies": {
-    "firebase-admin": "13.3.0",
-    "sqlite3": "5.1.7"
+    "firebase-admin": "13.3.0"
   }
 }
