@@ -8,9 +8,11 @@ import {
 	createDeepLazyProxy,
 	isArrayMetadata,
 	isObjectMetadata,
+	readHostResult,
 	throwIfErrorSentinel,
 } from './lazy-proxy';
 import { jmesPath } from './jmespath';
+import { decodeHostValue } from './transfer-codec';
 import { isKeyOf } from './utils';
 import type { BridgeMessage } from '../bridge/bridge-messages';
 
@@ -52,30 +54,23 @@ type InputRpcType = (typeof INPUT_RPC_TYPES)[keyof typeof INPUT_RPC_TYPES];
 // ============================================================================
 
 /**
- * The subset of `ivm.Reference` shape the in-isolate runtime relies on.
- * Declared locally rather than importing from `isolated-vm` because this
- * module is bundled into the isolate IIFE, where the native module is
- * unavailable. The host wires real `ivm.Reference` instances which
- * structurally satisfy this interface.
+ * A bridge callback as seen from inside the isolate: a plain function.
+ * The host wires these as `ivm.Callback` instances, which arrive in the
+ * isolate as ordinary functions whose arguments and return value are copied
+ * via the structured-clone algorithm.
  */
-interface BridgeCallback {
-	applySync(
-		thisArg: unknown,
-		args: unknown[],
-		options?: { arguments?: { copy?: boolean }; result?: { copy?: boolean } },
-	): unknown;
-}
+type BridgeCallback = (...args: unknown[]) => unknown;
 
 /**
- * Bridge callbacks the in-isolate runtime can invoke synchronously via
- * `ivm.Reference.applySync`.
+ * Bridge callbacks the in-isolate runtime invokes synchronously as plain
+ * functions (host-side `ivm.Callback` instances).
  *
  *   - `getValueAtPath`, `getArrayElement`: data-access primitives used by the
- *     lazy-proxy system. Hot path; one ivm.Reference each for minimum overhead.
+ *     lazy-proxy system. Hot path; one ivm.Callback each for minimum overhead.
  *   - `callHost`: typed-RPC dispatcher. The in-isolate runtime constructs
  *     an envelope (e.g. `{ type: 'getNodeFirst', nodeName, ... }`) and the
  *     host-side dispatcher validates it with zod before routing to a handler.
- *     A single ivm.Reference covers every typed operation; new operations
+ *     A single ivm.Callback covers every typed operation; new operations
  *     are new schemas in `bridge/bridge-messages.ts` + new cases in the
  *     dispatcher switch. The name reflects what this is: a synchronous
  *     host RPC, not a postMessage-style async send.
@@ -112,6 +107,10 @@ export function buildContext(
 		throw new Error(`Invalid timezone: "${timezone}"`);
 	}
 	Settings.defaultZone = timezone ?? 'system';
+
+	// Check the error flag before decoding. Decoded data can hold the flag as user data.
+	const callHost = (message: unknown) =>
+		decodeHostValue(readHostResult(callbacks.callHost(message)));
 
 	const target: Record<string, unknown> = {};
 
@@ -198,13 +197,7 @@ export function buildContext(
 		const lazyProxy = createDeepLazyProxy(['$', nodeName], undefined, callbacks);
 		const sendNodeMethod = (type: NodeRpcType) => {
 			return (branchIndex?: number, runIndex?: number) => {
-				const result = callbacks.callHost.applySync(
-					null,
-					[{ type, nodeName, branchIndex, runIndex }],
-					{ arguments: { copy: true }, result: { copy: true } },
-				);
-				throwIfErrorSentinel(result);
-				return result;
+				return callHost({ type, nodeName, branchIndex, runIndex });
 			};
 		};
 		// Paired-item cluster: `.pairedItem(idx?)`, `.itemMatching(idx)`,
@@ -217,20 +210,10 @@ export function buildContext(
 			type: 'getNodePairedItem' | 'getNodeItemMatching',
 			itemIndex?: number,
 		) => {
-			const result = callbacks.callHost.applySync(null, [{ type, nodeName, itemIndex }], {
-				arguments: { copy: true },
-				result: { copy: true },
-			});
-			throwIfErrorSentinel(result);
-			return result;
+			return callHost({ type, nodeName, itemIndex });
 		};
 		const sendGetNodeItem = () => {
-			const result = callbacks.callHost.applySync(null, [{ type: 'getNodeItem', nodeName }], {
-				arguments: { copy: true },
-				result: { copy: true },
-			});
-			throwIfErrorSentinel(result);
-			return result;
+			return callHost({ type: 'getNodeItem', nodeName });
 		};
 		return new Proxy({} as Record<string, unknown>, {
 			get(_emptyTarget, prop) {
@@ -271,12 +254,7 @@ export function buildContext(
 	const lazyInputProxy = createDeepLazyProxy(['$input'], undefined, callbacks);
 	const sendInputMethod = (type: InputRpcType) => {
 		return () => {
-			const result = callbacks.callHost.applySync(null, [{ type }], {
-				arguments: { copy: true },
-				result: { copy: true },
-			});
-			throwIfErrorSentinel(result);
-			return result;
+			return callHost({ type });
 		};
 	};
 	target.$input = new Proxy({} as Record<string, unknown>, {
@@ -295,13 +273,7 @@ export function buildContext(
 	// args, and the host's `WorkflowDataProxy.$items` applies its own
 	// defaults when fields are undefined.
 	target.$items = (nodeName?: string, outputIndex?: number, runIndex?: number) => {
-		const result = callbacks.callHost.applySync(
-			null,
-			[{ type: 'getItems', nodeName, outputIndex, runIndex }],
-			{ arguments: { copy: true }, result: { copy: true } },
-		);
-		throwIfErrorSentinel(result);
-		return result;
+		return callHost({ type: 'getItems', nodeName, outputIndex, runIndex });
 	};
 
 	// $fromAI / $fromAi / $fromai — AI-builder placeholder accessor.
@@ -316,13 +288,13 @@ export function buildContext(
 		valueType?: string,
 		defaultValue?: unknown,
 	) => {
-		const result = callbacks.callHost.applySync(
-			null,
-			[{ type: 'fromAi', name, description, valueType, defaultValue }],
-			{ arguments: { copy: true }, result: { copy: true } },
-		);
-		throwIfErrorSentinel(result);
-		return result;
+		return callHost({
+			type: 'fromAi',
+			name,
+			description,
+			valueType,
+			defaultValue,
+		});
 	};
 	target.$fromAI = sendFromAi;
 	target.$fromAi = sendFromAi;
@@ -333,13 +305,7 @@ export function buildContext(
 	// Under the VM engine this re-enters the bridge on a fresh evaluation;
 	// the legacy engine handles it inline.
 	target.$evaluateExpression = (expression: string, itemIndex?: number) => {
-		const result = callbacks.callHost.applySync(
-			null,
-			[{ type: 'evaluateExpression', expression, itemIndex }],
-			{ arguments: { copy: true }, result: { copy: true } },
-		);
-		throwIfErrorSentinel(result);
-		return result;
+		return callHost({ type: 'evaluateExpression', expression, itemIndex });
 	};
 
 	// $getPairedItem — walks the paired-item ancestry chain back to the
@@ -352,20 +318,12 @@ export function buildContext(
 		incomingSourceData: unknown,
 		initialPairedItem: unknown,
 	) => {
-		const result = callbacks.callHost.applySync(
-			null,
-			[
-				{
-					type: 'getPairedItem',
-					destinationNodeName,
-					incomingSourceData,
-					initialPairedItem,
-				},
-			],
-			{ arguments: { copy: true }, result: { copy: true } },
-		);
-		throwIfErrorSentinel(result);
-		return result;
+		return callHost({
+			type: 'getPairedItem',
+			destinationNodeName,
+			incomingSourceData,
+			initialPairedItem,
+		});
 	};
 
 	// -------------------------------------------------------------------------
@@ -374,7 +332,7 @@ export function buildContext(
 	// so each key is fetched at most once per evaluation.
 	// -------------------------------------------------------------------------
 
-	// Track keys we've already probed so we never call applySync twice
+	// Track keys we've already probed so we never call getValueAtPath twice
 	// for the same key — even if the host returned undefined.
 	const probedKeys = new Set<string>();
 
@@ -383,10 +341,7 @@ export function buildContext(
 
 		let value: unknown;
 		try {
-			value = callbacks.getValueAtPath.applySync(null, [[key]], {
-				arguments: { copy: true },
-				result: { copy: true },
-			});
+			value = callbacks.getValueAtPath([key]);
 		} catch {
 			// Don't mark as probed — the throw may be transient
 			// (e.g. host data not yet available) and a retry should be allowed.
@@ -414,8 +369,8 @@ export function buildContext(
 			return true;
 		}
 
-		// Primitive or null — store directly
-		target[key] = value;
+		// Decode after the metadata checks. User data can hold the same keys.
+		target[key] = decodeHostValue(value);
 		return true;
 	}
 

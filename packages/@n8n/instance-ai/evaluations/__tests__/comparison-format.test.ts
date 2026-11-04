@@ -67,6 +67,7 @@ function evaluation(
 				conversation: [{ role: 'user', text: tc.userText ?? 'Test workflow prompt' }],
 				complexity: 'medium' as const,
 				tags: [],
+				datasets: ['full'],
 				executionScenarios: (tc.scenarios ?? []).map((sa) => ({
 					name: sa.name,
 					description: '',
@@ -76,7 +77,7 @@ function evaluation(
 			} as WorkflowTestCase;
 			const buildSuccessCount = tc.buildSuccessCount ?? totalRuns;
 			const scenarios = (tc.scenarios ?? []).map((sa) => ({
-				scenario: testCase.executionScenarios.find((sc) => sc.name === sa.name)!,
+				scenario: testCase.executionScenarios!.find((sc) => sc.name === sa.name)!,
 				evaluatedCount: sa.passes.length,
 				passCount: sa.passCount,
 				passRate: totalRuns > 0 ? sa.passCount / totalRuns : 0,
@@ -84,7 +85,7 @@ function evaluation(
 				passHatK: new Array(totalRuns).fill(sa.passCount === totalRuns ? 1 : 0) as number[],
 				runs: sa.passes.map(
 					(passed): ExecutionScenarioResult => ({
-						scenario: testCase.executionScenarios.find((sc) => sc.name === sa.name)!,
+						scenario: testCase.executionScenarios!.find((sc) => sc.name === sa.name)!,
 						success: passed,
 						score: passed ? 1 : 0,
 						reasoning: sa.reasoning ?? '',
@@ -166,6 +167,16 @@ describe('formatComparisonMarkdown', () => {
 		expect(md).toMatch(/`a\/happy`/);
 		expect(md).toMatch(/0\/3 \(0%\)/);
 		expect(md).toMatch(/-100pp ↓/);
+	});
+
+	it('labels Agent eval reports and uses a generic test-case column', () => {
+		const md = formatComparisonMarkdown(evalFixture, undefined, { subject: 'agent' });
+		const terminal = formatComparisonTerminal(evalFixture, undefined, { subject: 'agent' });
+
+		expect(md).toMatch(/^### Instance AI Agent Eval/);
+		expect(md).toContain('| Test case | Status | pass@3 | pass^3 |');
+		expect(md).not.toContain('| Workflow |');
+		expect(terminal).toMatch(/^Instance AI Agent Eval/);
 	});
 
 	it('renders run-level pass metrics and the LangSmith experiment link when provided', () => {
@@ -548,6 +559,22 @@ describe('formatComparisonMarkdown', () => {
 		expect(breakdownIdx).toBeLessThan(perTcIdx);
 		expect(md).toMatch(/3 of 3 failed · 3× builder_issue/);
 		expect(md).toMatch(/Run 1 \[builder_issue\]: Builder produced/);
+	});
+
+	it('marks a case that built an Agent as "(agent)" in both renderers', () => {
+		const ev = evaluation({
+			totalRuns: 2,
+			testCases: [{ scenarios: [{ name: 'happy', passCount: 2, passes: [true, true] }] }],
+		});
+		ev.testCases[0].runs[1].agentId = 'agent-1';
+		const slugs = slugMap(ev, ['a']);
+		const pr = bucket('pr', [s('a', 'happy', 2, 2)]);
+		const outcome = ok(compareBuckets(pr, pr));
+
+		expect(formatComparisonMarkdown(ev, outcome, { slugByTestCase: slugs })).toMatch(
+			/`a` \(agent\)/,
+		);
+		expect(formatComparisonTerminal(ev, outcome, { slugByTestCase: slugs })).toMatch(/a \(agent\)/);
 	});
 
 	it('uses `file/scenario` slug headers in the bottom Failure details section', () => {

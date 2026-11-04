@@ -12,7 +12,8 @@ import {
 	N8nText,
 } from '@n8n/design-system';
 
-import { DEBOUNCE_TIME, getDebounceTime } from '@/app/constants';
+import { getDebounceTime } from '@n8n/composables/useDebounce';
+import { DEBOUNCE_TIME } from '@/app/constants';
 import { useEvaluationsWizardSidepanelStore } from '../../wizardSidepanel.store';
 import { useTestCasePersistence } from '../../composables/useTestCasePersistence';
 import { useAiRootNodes } from '../../composables/useAiRootNodes';
@@ -72,14 +73,15 @@ function onSelectNode(name: string) {
 }
 
 // Persist suite-config edits (node + metrics) with a debounced, silent save.
-const persist = useDebounceFn(
-	() => void saveConfig({ silent: true }),
-	getDebounceTime(DEBOUNCE_TIME.API.AUTOSAVE),
-);
+const persist = useDebounceFn(() => {
+	void saveConfig({ silent: true });
+}, getDebounceTime(DEBOUNCE_TIME.API.AUTOSAVE));
 
 watch(
 	[aiNodeName, selectedMetricKeys, customChecks, judgeSelectionByMetric],
-	() => void persist(),
+	() => {
+		void persist();
+	},
 	{
 		deep: true,
 	},
@@ -120,7 +122,7 @@ watch(
 			<N8nButton
 				v-for="metric in selectedCannedMetrics"
 				:key="metric.key"
-				variant="subtle"
+				variant="outline"
 				size="small"
 				icon="x"
 				:aria-label="locale.baseText('evaluations.tests.detail.removeMetric')"

@@ -4,10 +4,12 @@ import { TestCaseExecutionErrorCode } from '@n8n/db';
 import type {
 	EvaluationCollectionRepository,
 	EvaluationConfigRepository,
+	OperationContext,
 	Project,
 	TestRun,
 	TestCaseExecutionRepository,
 	TestRunRepository,
+	TransactionRunner,
 	WorkflowRepository,
 } from '@n8n/db';
 import { readFileSync } from 'fs';
@@ -16,11 +18,11 @@ import {
 	createRunExecutionData,
 	EVALUATION_NODE_TYPE,
 	EVALUATION_TRIGGER_NODE_TYPE,
+	ManualExecutionCancelledError,
 	NodeConnectionTypes,
 } from 'n8n-workflow';
 import type { IWorkflowBase, IRun, ExecutionError } from 'n8n-workflow';
 import path from 'path';
-import type { Mock } from 'vitest';
 import { mock } from 'vitest-mock-extended';
 
 import type { ActiveExecutions } from '@/active-executions';
@@ -75,6 +77,10 @@ describe('TestRunnerService', () => {
 	const evaluationConfigRepository = mock<EvaluationConfigRepository>();
 	const workflowCompiler = mock<WorkflowCompilerService>();
 	const ownershipService = mock<OwnershipService>();
+	const txRunner = mock<TransactionRunner>();
+	// Sentinel the mocked runner hands to every `run` callback. Asserting it on
+	// repository calls proves the service threads the transaction ctx through.
+	const TRX_CTX = { trx: { id: 'trx-sentinel' } } as unknown as OperationContext;
 	let testRunnerService: TestRunnerService;
 
 	mockInstance(LoadNodesAndCredentials, {
@@ -82,6 +88,7 @@ describe('TestRunnerService', () => {
 	});
 
 	beforeEach(() => {
+		txRunner.run.mockImplementation(async (ctx, fn) => await fn({ ...ctx, ...TRX_CTX }));
 		testRunnerService = new TestRunnerService(
 			logger,
 			telemetry,
@@ -102,6 +109,7 @@ describe('TestRunnerService', () => {
 			evaluationConfigRepository,
 			workflowCompiler,
 			ownershipService,
+			txRunner,
 		);
 
 		testRunRepository.createTestRun.mockResolvedValue(mock<TestRun>({ id: 'test-run-id' }));
@@ -112,6 +120,47 @@ describe('TestRunnerService', () => {
 
 	afterEach(() => {
 		vi.resetAllMocks();
+	});
+
+	describe('getEndNodeOutputs (per-case output capture)', () => {
+		// Private helper that feeds the compare Outputs tab; exercised directly.
+		const readOutputs = (execution: IRun, endNodeName: string) =>
+			(
+				testRunnerService as unknown as {
+					getEndNodeOutputs(execution: IRun, endNodeName: string): Record<string, unknown>;
+				}
+			).getEndNodeOutputs(execution, endNodeName);
+
+		test('reads the output from the first non-empty main branch (IF/Switch false branch)', () => {
+			const execution = mock<IRun>({
+				data: {
+					resultData: {
+						runData: {
+							End: [
+								{
+									data: {
+										main: [
+											[], // branch 0 — not taken
+											[{ json: { answer: 'from the false branch' } }], // branch 1 — taken
+										],
+									},
+								},
+							],
+						},
+					},
+				},
+			});
+
+			expect(readOutputs(execution, 'End')).toEqual({ answer: 'from the false branch' });
+		});
+
+		test('returns an empty object when the end node produced no items', () => {
+			const execution = mock<IRun>({
+				data: { resultData: { runData: { End: [{ data: { main: [[]] } }] } } },
+			});
+
+			expect(readOutputs(execution, 'End')).toEqual({});
+		});
 	});
 
 	describe('findEvaluationTriggerNode', () => {
@@ -554,6 +603,7 @@ describe('TestRunnerService', () => {
 				evaluationConfigRepository,
 				workflowCompiler,
 				ownershipService,
+				txRunner,
 			);
 			process.env.OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS = 'true';
 
@@ -879,6 +929,7 @@ describe('TestRunnerService', () => {
 					evaluationConfigRepository,
 					workflowCompiler,
 					ownershipService,
+					txRunner,
 				);
 			});
 
@@ -2109,16 +2160,6 @@ describe('TestRunnerService', () => {
 			);
 			testCaseExecutionRepository.tryMarkCaseAsRunning.mockResolvedValue(true);
 			testCaseExecutionRepository.update.mockResolvedValue({ affected: 1 } as never);
-			// `manager` is a TypeORM EntityManager not auto-deep-mocked by mock<T>().
-			// Provide a transaction stub that just invokes the callback so cancel
-			// paths run end-to-end.
-			Object.assign(testRunRepository, {
-				manager: {
-					transaction: vi
-						.fn()
-						.mockImplementation(async (cb: (trx: unknown) => Promise<unknown>) => await cb({})),
-				},
-			});
 
 			let runCallIndex = 0;
 			const inFlightTracker = { inFlight: 0, max: 0, perCaseStarted: 0 };
@@ -2384,6 +2425,7 @@ describe('TestRunnerService', () => {
 				evaluationConfigRepository,
 				workflowCompiler,
 				ownershipService,
+				txRunner,
 			);
 			setupHappyPathMocks(2);
 			const originalEnv = process.env.N8N_CONCURRENCY_EVALUATION_LIMIT;
@@ -2464,6 +2506,7 @@ describe('TestRunnerService', () => {
 				evaluationConfigRepository,
 				workflowCompiler,
 				ownershipService,
+				txRunner,
 			);
 
 			const { inFlightTracker } = setupHappyPathMocks(6);
@@ -2534,8 +2577,15 @@ describe('TestRunnerService', () => {
 			);
 			expect(errorRows).toHaveLength(0);
 
-			// Run is marked cancelled, not completed.
-			expect(testRunRepository.markAsCancelled).toHaveBeenCalled();
+			// Run is marked cancelled (inside the runner's transaction), not completed.
+			expect(testRunRepository.markAsCancelled).toHaveBeenCalledWith(
+				'test-run-id',
+				expect.objectContaining(TRX_CTX),
+			);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledWith(
+				'test-run-id',
+				expect.objectContaining(TRX_CTX),
+			);
 			expect(testRunRepository.markAsCompleted).not.toHaveBeenCalled();
 		});
 
@@ -2564,6 +2614,7 @@ describe('TestRunnerService', () => {
 				evaluationConfigRepository,
 				workflowCompiler,
 				ownershipService,
+				txRunner,
 			);
 
 			setupHappyPathMocks(4);
@@ -2578,8 +2629,37 @@ describe('TestRunnerService', () => {
 			await multiMainService.runTest(USER as never, WORKFLOW_ID, 1);
 
 			expect(testRunRepository.isCancellationRequested).toHaveBeenCalled();
-			expect(testRunRepository.markAsCancelled).toHaveBeenCalled();
+			expect(testRunRepository.markAsCancelled).toHaveBeenCalledWith(
+				'test-run-id',
+				expect.objectContaining(TRX_CTX),
+			);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledWith(
+				'test-run-id',
+				expect.objectContaining(TRX_CTX),
+			);
 			expect(testRunRepository.markAsCompleted).not.toHaveBeenCalled();
+		});
+
+		test('a cancelled dataset execution marks the run cancelled inside one transaction', async () => {
+			setupHappyPathMocks(1);
+			// The dataset trigger awaits its execution with no abort listener, so a
+			// cancelled execution surfaces as a rejection and takes the
+			// `ExecutionCancelledError` branch, not the error branch.
+			activeExecutions.getPostExecutePromise.mockRejectedValueOnce(
+				new ManualExecutionCancelledError('dataset-exec'),
+			);
+
+			await testRunnerService.runTest(USER as never, WORKFLOW_ID, 1);
+
+			expect(testRunRepository.markAsCancelled).toHaveBeenCalledWith(
+				'test-run-id',
+				expect.objectContaining(TRX_CTX),
+			);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledWith(
+				'test-run-id',
+				expect.objectContaining(TRX_CTX),
+			);
+			expect(testRunRepository.markAsError).not.toHaveBeenCalled();
 		});
 
 		// Cache-invalidation hook (TRUST-80). When a run that belongs to an
@@ -2847,6 +2927,7 @@ describe('TestRunnerService', () => {
 				evaluationConfigRepository,
 				workflowCompiler,
 				ownershipService,
+				txRunner,
 			);
 
 			testRunRepository.find.mockResolvedValue([{ id: 'tr-running' } as never]);
@@ -2895,24 +2976,12 @@ describe('TestRunnerService', () => {
 				testRunnerService as unknown as { abortControllers: Map<string, AbortController> }
 			).abortControllers.set('tr-new-local', newRunAbort);
 
-			// Provide a no-op dbManager so the DB-fallback path doesn't throw
-			// on the pre-fix code path that *would* take it for this run.
-			// Without this, the test would fail on a transaction TypeError
-			// before reaching the abort assertions, hiding the actual bug.
-			const dbManager = mock<{ transaction: Mock }>();
-			dbManager.transaction.mockImplementation(async (cb: (trx: unknown) => Promise<void>) => {
-				await cb({});
-			});
-			(testRunRepository as unknown as { manager: typeof dbManager }).manager = dbManager;
-
 			await testRunnerService.cancelCollection('col-new-window');
 
 			expect(newRunAbort.signal.aborted).toBe(true);
 			// Local abort wins — no DB-cancel fallback needed for this run.
-			expect(testRunRepository.markAsCancelled).not.toHaveBeenCalledWith(
-				'tr-new-local',
-				expect.anything(),
-			);
+			expect(txRunner.run).not.toHaveBeenCalled();
+			expect(testRunRepository.markAsCancelledIfActive).not.toHaveBeenCalled();
 		});
 
 		test('falls back to DB cancel for runs not held locally', async () => {
@@ -2923,35 +2992,24 @@ describe('TestRunnerService', () => {
 			(
 				testRunnerService as unknown as { abortControllers: Map<string, AbortController> }
 			).abortControllers.set('tr-mine', new AbortController());
-
-			const trxUpdate = vi.fn().mockResolvedValue({ affected: 1 });
-			const dbManager = mock<{ transaction: Mock }>();
-			dbManager.transaction.mockImplementation(
-				async (cb: (trx: { update: Mock }) => Promise<void>) => {
-					await cb({ update: trxUpdate });
-				},
-			);
-			(testRunRepository as unknown as { manager: typeof dbManager }).manager = dbManager;
+			testRunRepository.markAsCancelledIfActive.mockResolvedValue(true);
 
 			await testRunnerService.cancelCollection('col-2');
 
-			// `tr-foreign` is the run we don't hold locally → fallback fires.
-			// Assert the update is scoped to `id` AND `status: In([...])` so a
-			// run that completed between the initial find and this update is
-			// not clobbered. We don't lock down the exact entity ref — the
-			// shape of the where clause is the contract.
-			expect(trxUpdate).toHaveBeenCalledWith(
-				expect.anything(),
-				expect.objectContaining({
-					id: 'tr-foreign',
-					status: expect.anything(),
-				}),
-				expect.objectContaining({ status: 'cancelled' }),
+			// `tr-foreign` is the run we don't hold locally → fallback fires in
+			// one transaction, and its ctx reaches both repository calls.
+			expect(txRunner.run).toHaveBeenCalledTimes(1);
+			expect(testRunRepository.markAsCancelledIfActive).toHaveBeenCalledWith(
+				'tr-foreign',
+				expect.objectContaining(TRX_CTX),
+			);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledWith(
+				'tr-foreign',
+				expect.objectContaining(TRX_CTX),
 			);
 			// `tr-mine` was held locally → no fallback update should fire.
-			expect(trxUpdate).not.toHaveBeenCalledWith(
-				expect.anything(),
-				expect.objectContaining({ id: 'tr-mine' }),
+			expect(testRunRepository.markAsCancelledIfActive).not.toHaveBeenCalledWith(
+				'tr-mine',
 				expect.anything(),
 			);
 		});
@@ -2960,35 +3018,39 @@ describe('TestRunnerService', () => {
 			// `activeRuns` is sampled before the requestCancellation loop and
 			// pubsub broadcast. By the time the fallback transaction runs, a
 			// foreign main may have completed (or errored) the run naturally.
-			// The status-scoped update should affect 0 rows in that case, and
-			// the test-case sweep must be skipped — otherwise we'd silently
+			// The status-scoped guard then reports no row flipped, and the
+			// test-case sweep must be skipped — otherwise we'd silently
 			// re-mark a `completed` run as `cancelled` and corrupt the record.
 			testRunRepository.find.mockResolvedValue([{ id: 'tr-just-finished' } as never]);
-
-			const trxUpdate = vi.fn().mockResolvedValue({ affected: 0 }); // race: row no longer 'new'/'running'
-			const dbManager = mock<{ transaction: Mock }>();
-			dbManager.transaction.mockImplementation(
-				async (cb: (trx: { update: Mock }) => Promise<void>) => {
-					await cb({ update: trxUpdate });
-				},
-			);
-			(testRunRepository as unknown as { manager: typeof dbManager }).manager = dbManager;
+			testRunRepository.markAsCancelledIfActive.mockResolvedValue(false);
 
 			await testRunnerService.cancelCollection('col-race');
 
-			// Update was attempted with status filter — the filter is what
-			// makes the in-DB WHERE narrow so the row stays untouched.
-			expect(trxUpdate).toHaveBeenCalledWith(
-				expect.anything(),
-				expect.objectContaining({ id: 'tr-just-finished', status: expect.anything() }),
-				expect.objectContaining({ status: 'cancelled' }),
-			);
-			// Update affected 0 → don't sweep cases. (The sweep has its own
-			// status filter so this is also a redundant check, but it makes
-			// the "winner takes all" intent explicit at the run level.)
-			expect(testCaseExecutionRepository.markAllPendingAsCancelled).not.toHaveBeenCalledWith(
+			expect(testRunRepository.markAsCancelledIfActive).toHaveBeenCalledWith(
 				'tr-just-finished',
 				expect.anything(),
+			);
+			// Guard reported no flip → don't sweep cases. (The sweep has its own
+			// status filter so this is also a redundant check, but it makes
+			// the "winner takes all" intent explicit at the run level.)
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).not.toHaveBeenCalled();
+		});
+
+		test('sweeps cases only for the runs the guard actually flipped', async () => {
+			testRunRepository.find.mockResolvedValue([
+				{ id: 'tr-still-active' } as never,
+				{ id: 'tr-just-finished' } as never,
+			]);
+			testRunRepository.markAsCancelledIfActive.mockImplementation(
+				async (id) => id === 'tr-still-active',
+			);
+
+			await testRunnerService.cancelCollection('col-mixed');
+
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledTimes(1);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledWith(
+				'tr-still-active',
+				expect.objectContaining(TRX_CTX),
 			);
 		});
 	});
@@ -3085,13 +3147,6 @@ describe('TestRunnerService', () => {
 			);
 			testCaseExecutionRepository.tryMarkCaseAsRunning.mockResolvedValue(true);
 			testCaseExecutionRepository.update.mockResolvedValue({ affected: 1 } as never);
-			Object.assign(testRunRepository, {
-				manager: {
-					transaction: vi
-						.fn()
-						.mockImplementation(async (cb: (trx: unknown) => Promise<unknown>) => await cb({})),
-				},
-			});
 
 			let runCallIndex = 0;
 			workflowRunner.run.mockImplementation(async () => {
@@ -3169,6 +3224,154 @@ describe('TestRunnerService', () => {
 
 			expect(ranTestCall?.run_type).toBe('config');
 			expect(finishedCall?.run_type).toBe('config');
+		});
+	});
+
+	describe('per-case inputs/outputs capture (config-compiled runs)', () => {
+		const TRIGGER_NODE_NAME = 'Dataset Trigger';
+		const METRICS_NODE_NAME = 'Set Metrics';
+		const START_NODE_NAME = 'Start';
+		const END_NODE_NAME = 'Agent';
+		const USER_OBJ = mock<{ id: string }>({ id: 'user-out' });
+		const WORKFLOW_ID = 'wf-out';
+
+		// A config-compiled workflow: eval trigger → end node (the node under
+		// test) → metrics. Crucially it has NO Set Outputs node, which is exactly
+		// the shape the compiler emits and the reason per-case outputs were empty.
+		const buildCompiledWorkflow = (): IWorkflowBase =>
+			({
+				id: WORKFLOW_ID,
+				name: 'Compiled Eval Workflow',
+				active: false,
+				nodes: [
+					{
+						id: 'trigger',
+						name: TRIGGER_NODE_NAME,
+						type: EVALUATION_TRIGGER_NODE_TYPE,
+						typeVersion: 4.7,
+						position: [0, 0] as [number, number],
+						parameters: { source: 'dataTable', dataTableId: 'dt-1' },
+					},
+					{
+						id: 'agent',
+						name: END_NODE_NAME,
+						type: 'n8n-nodes-base.set',
+						typeVersion: 1,
+						position: [200, 0] as [number, number],
+						parameters: {},
+					},
+					{
+						id: 'metrics',
+						name: METRICS_NODE_NAME,
+						type: EVALUATION_NODE_TYPE,
+						typeVersion: 4.7,
+						position: [400, 0] as [number, number],
+						parameters: {
+							operation: 'setMetrics',
+							metric: 'customMetrics',
+							metrics: { assignments: [{ id: '1', name: 'score', value: 1 }] },
+						},
+					},
+				],
+				connections: {},
+				settings: {},
+			}) as unknown as IWorkflowBase;
+
+		const buildDatasetExecution = (): IRun =>
+			({
+				data: {
+					resultData: {
+						runData: {
+							[TRIGGER_NODE_NAME]: [
+								{
+									data: { [NodeConnectionTypes.Main]: [[{ json: { caseId: 0 } }]] },
+								},
+							],
+						},
+					},
+				},
+			}) as unknown as IRun;
+
+		// The per-case execution: the end node produced an answer and the metrics
+		// node produced a score. No Set Outputs node ran.
+		const buildCaseExecution = (): IRun =>
+			({
+				data: {
+					resultData: {
+						runData: {
+							[END_NODE_NAME]: [
+								{
+									data: {
+										[NodeConnectionTypes.Main]: [[{ json: { output: 'The capital is Paris' } }]],
+									},
+								},
+							],
+							[METRICS_NODE_NAME]: [
+								{
+									data: { [NodeConnectionTypes.Main]: [[{ json: { score: 1 } }]] },
+								},
+							],
+						},
+					},
+				},
+			}) as unknown as IRun;
+
+		// Drives a full config-compiled run and returns the success-status patch
+		// persisted for the single case, so each test can assert its field.
+		const runConfigCaseAndGetSuccessPatch = async (): Promise<Record<string, unknown>> => {
+			const compiled = buildCompiledWorkflow();
+			workflowRepository.findById.mockResolvedValue(compiled as never);
+			workflowCompiler.compile.mockReturnValue(compiled as never);
+			concurrencyControlService.throttle.mockResolvedValue(undefined as never);
+			testRunRepository.markAsRunning.mockResolvedValue(undefined as never);
+			testRunRepository.markAsCompleted.mockResolvedValue(undefined as never);
+			testRunRepository.clearInstanceTracking.mockResolvedValue(undefined as never);
+			testRunRepository.isCancellationRequested.mockResolvedValue(false);
+			testCaseExecutionRepository.createPendingBatch.mockImplementation(
+				async (_runId, runIndices) =>
+					runIndices.map((_, i) => ({ id: `seeded-case-${i}` }) as never),
+			);
+			testCaseExecutionRepository.tryMarkCaseAsRunning.mockResolvedValue(true);
+			testCaseExecutionRepository.update.mockResolvedValue({ affected: 1 } as never);
+
+			let runCallIndex = 0;
+			workflowRunner.run.mockImplementation(async () =>
+				runCallIndex++ === 0 ? 'dataset-exec' : 'case-exec',
+			);
+			activeExecutions.getPostExecutePromise.mockImplementation(async (id) =>
+				id === 'dataset-exec' ? buildDatasetExecution() : buildCaseExecution(),
+			);
+
+			const snapshot = {
+				id: 'cfg-1',
+				workflowId: WORKFLOW_ID,
+				startNodeName: START_NODE_NAME,
+				endNodeName: END_NODE_NAME,
+			} as never;
+
+			const { finished } = await testRunnerService.startTestRun(USER_OBJ as never, WORKFLOW_ID, 1, {
+				evaluationConfigId: 'cfg-1',
+				evaluationConfigSnapshot: snapshot,
+				compileFromConfig: true,
+			});
+			await finished.catch(() => undefined);
+
+			const successUpdate = testCaseExecutionRepository.update.mock.calls.find(
+				([, patch]) => (patch as { status?: string }).status === 'success',
+			);
+			expect(successUpdate).toBeDefined();
+			return successUpdate?.[1] as Record<string, unknown>;
+		};
+
+		it('persists the end-node output as per-case outputs when there is no Set Outputs node', async () => {
+			const patch = await runConfigCaseAndGetSuccessPatch();
+			expect(patch.outputs).toEqual({ output: 'The capital is Paris' });
+		});
+
+		it('persists the dataset row as per-case inputs when there is no Set Inputs node', async () => {
+			const patch = await runConfigCaseAndGetSuccessPatch();
+			// The dataset row pinned to the eval trigger (would be {} without the fix).
+			expect(patch.inputs).toEqual({ caseId: 0 });
 		});
 	});
 
@@ -3263,21 +3466,14 @@ describe('TestRunnerService', () => {
 			testCaseExecutionRepository.markAllPendingAsCancelled.mockResolvedValue(undefined as never);
 
 			const capturedRunIndices: number[][] = [];
-			testCaseExecutionRepository.createPendingBatch.mockImplementation(
-				async (_runId, runIndices) => {
-					capturedRunIndices.push([...runIndices]);
-					return runIndices.map((_, i) => ({ id: `seeded-case-${i}` }) as never);
-				},
-			);
+			const capturedInputs: unknown[][] = [];
+			testCaseExecutionRepository.createPendingBatch.mockImplementation(async (_runId, cases) => {
+				capturedRunIndices.push(cases.map((c) => c.runIndex));
+				capturedInputs.push(cases.map((c) => c.inputs));
+				return cases.map((_, i) => ({ id: `seeded-case-${i}` }) as never);
+			});
 			testCaseExecutionRepository.tryMarkCaseAsRunning.mockResolvedValue(true);
 			testCaseExecutionRepository.update.mockResolvedValue({ affected: 1 } as never);
-			Object.assign(testRunRepository, {
-				manager: {
-					transaction: vi
-						.fn()
-						.mockImplementation(async (cb: (trx: unknown) => Promise<unknown>) => await cb({})),
-				},
-			});
 
 			let runCallIndex = 0;
 			workflowRunner.run.mockImplementation(async () => {
@@ -3290,11 +3486,11 @@ describe('TestRunnerService', () => {
 				return buildCaseExecution(1);
 			});
 
-			return { capturedRunIndices };
+			return { capturedRunIndices, capturedInputs };
 		};
 
 		test('with no rowIndices, all rows run and createPendingBatch receives sequential indices', async () => {
-			const { capturedRunIndices } = setupRowIndicesMocks(5);
+			const { capturedRunIndices, capturedInputs } = setupRowIndicesMocks(5);
 
 			await testRunnerService.runTest(USER as never, WORKFLOW_ID, 1);
 
@@ -3302,12 +3498,21 @@ describe('TestRunnerService', () => {
 			expect(workflowRunner.run).toHaveBeenCalledTimes(6);
 			// createPendingBatch should have been called with [0, 1, 2, 3, 4].
 			expect(capturedRunIndices[0]).toEqual([0, 1, 2, 3, 4]);
+			// Each pending row is seeded with its dataset-row input up front, so the
+			// compare view can show it while the case is still pending.
+			expect(capturedInputs[0]).toEqual([
+				{ caseId: 0 },
+				{ caseId: 1 },
+				{ caseId: 2 },
+				{ caseId: 3 },
+				{ caseId: 4 },
+			]);
 			expect(testRunRepository.markAsCompleted).toHaveBeenCalledTimes(1);
 		});
 
 		test('with rowIndices: [7], only dataset row 7 runs and its runIndex equals 7', async () => {
 			// Dataset has 10 rows (indices 0–9). We only want row 7.
-			const { capturedRunIndices } = setupRowIndicesMocks(10);
+			const { capturedRunIndices, capturedInputs } = setupRowIndicesMocks(10);
 			testRunRepository.createTestRun.mockResolvedValue(mock<TestRun>({ id: 'tr-subset' }));
 
 			await testRunnerService
@@ -3320,6 +3525,9 @@ describe('TestRunnerService', () => {
 			expect(workflowRunner.run).toHaveBeenCalledTimes(2);
 			// The pending batch must be seeded with exactly index 7 — not 0.
 			expect(capturedRunIndices[0]).toEqual([7]);
+			// ...and its seeded input must be dataset row 7, not row 0 — proving the
+			// position→dataset-index mapping carries through to the seeded input.
+			expect(capturedInputs[0]).toEqual([{ caseId: 7 }]);
 			expect(testRunRepository.markAsCompleted).toHaveBeenCalledTimes(1);
 		});
 
@@ -3389,36 +3597,50 @@ describe('TestRunnerService', () => {
 	});
 
 	describe('cancelTestRun', () => {
+		test('falls back to a DB cancel in one transaction when the run is not held locally', async () => {
+			// No abort controller registered → `cancelTestRunLocally` returns
+			// false → fallback path fires.
+			testRunRepository.markAsCancelledIfActive.mockResolvedValue(true);
+
+			await testRunnerService.cancelTestRun('tr-foreign');
+
+			expect(testRunRepository.requestCancellation).toHaveBeenCalledWith('tr-foreign');
+			expect(txRunner.run).toHaveBeenCalledTimes(1);
+			expect(testRunRepository.markAsCancelledIfActive).toHaveBeenCalledWith(
+				'tr-foreign',
+				expect.objectContaining(TRX_CTX),
+			);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).toHaveBeenCalledWith(
+				'tr-foreign',
+				expect.objectContaining(TRX_CTX),
+			);
+		});
+
 		test('fallback update does not clobber a run that completed between requestCancellation and update', async () => {
 			// Mirrors the collection-level race: between `requestCancellation`
 			// (the DB-flag pass) and this fallback update, a foreign main can
-			// finish the run naturally. The update must be scoped by status
-			// so the terminal state wins.
-			// No abort controller registered → `cancelTestRunLocally` returns
-			// false → fallback path fires.
-			const trxUpdate = vi.fn().mockResolvedValue({ affected: 0 });
-			const dbManager = mock<{ transaction: Mock }>();
-			dbManager.transaction.mockImplementation(
-				async (cb: (trx: { update: Mock }) => Promise<void>) => {
-					await cb({ update: trxUpdate });
-				},
-			);
-			(testRunRepository as unknown as { manager: typeof dbManager }).manager = dbManager;
+			// finish the run naturally. The status-scoped guard reports no
+			// flip, so the terminal state wins and no cases are swept.
+			testRunRepository.markAsCancelledIfActive.mockResolvedValue(false);
 
 			await testRunnerService.cancelTestRun('tr-just-finished');
 
-			expect(trxUpdate).toHaveBeenCalledWith(
-				expect.anything(),
-				expect.objectContaining({
-					id: 'tr-just-finished',
-					status: expect.anything(),
-				}),
-				expect.objectContaining({ status: 'cancelled' }),
-			);
-			expect(testCaseExecutionRepository.markAllPendingAsCancelled).not.toHaveBeenCalledWith(
+			expect(testRunRepository.markAsCancelledIfActive).toHaveBeenCalledWith(
 				'tr-just-finished',
 				expect.anything(),
 			);
+			expect(testCaseExecutionRepository.markAllPendingAsCancelled).not.toHaveBeenCalled();
+		});
+
+		test('skips the DB fallback when the run is held locally', async () => {
+			(
+				testRunnerService as unknown as { abortControllers: Map<string, AbortController> }
+			).abortControllers.set('tr-mine', new AbortController());
+
+			await testRunnerService.cancelTestRun('tr-mine');
+
+			expect(txRunner.run).not.toHaveBeenCalled();
+			expect(testRunRepository.markAsCancelledIfActive).not.toHaveBeenCalled();
 		});
 	});
 });

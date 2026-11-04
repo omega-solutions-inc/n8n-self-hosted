@@ -23,11 +23,13 @@ import {
 	NodeOperationError,
 	jsonParse,
 	removeCircularRefs,
-	sleep,
 	setSafeObjectProperty,
+	sleepUnlessExecutionCancelled,
+	throwIfExecutionCancelled,
 } from 'n8n-workflow';
 import type { Readable } from 'stream';
 
+import { applyTemplatedAuth } from '@utils/templated-auth';
 import { keysToLowercase } from '@utils/utilities';
 
 import { mainProperties } from './Description';
@@ -37,6 +39,7 @@ import {
 	getAllowedDomains,
 	getOAuth2AdditionalParameters,
 	getSecrets,
+	isStream,
 	prepareRequestBody,
 	reduceAsync,
 	replaceNullValues,
@@ -46,9 +49,11 @@ import {
 } from '../GenericFunctions';
 import { setFilename } from './utils/binaryData';
 import { mimeTypeFromResponse } from './utils/parse';
+import { getResponseForContext } from './utils/response-context';
 import { configureResponseOptimizer } from '../shared/optimizeResponse';
 
 import { binaryToStringWithEncodingDetection } from './utils/buffer-decoding';
+import { createErrorDetails } from './utils/error-details';
 
 function toText<T>(data: T) {
 	if (typeof data === 'object' && data !== null) {
@@ -65,6 +70,8 @@ function isPaginationRequestType(value: string): value is 'body' | 'headers' | '
 	return value === 'body' || value === 'headers' || value === 'qs';
 }
 
+const methodsWithoutBody = ['HEAD', 'OPTIONS', 'TRACE'];
+
 export class HttpRequestV3 implements INodeType {
 	description: INodeTypeDescription;
 
@@ -72,7 +79,7 @@ export class HttpRequestV3 implements INodeType {
 		this.description = {
 			...baseDescription,
 			subtitle: '={{$parameter["method"] + ": " + $parameter["url"]}}',
-			version: [3, 4, 4.1, 4.2, 4.3, 4.4],
+			version: [3, 4, 4.1, 4.2, 4.3, 4.4, 4.5],
 			defaults: {
 				name: 'HTTP Request',
 				color: '#0004F5',
@@ -124,6 +131,7 @@ export class HttpRequestV3 implements INodeType {
 		let httpHeaderAuth;
 		let httpQueryAuth;
 		let httpCustomAuth;
+		let httpTemplatedCustomAuth;
 		let oAuth1Api;
 		let oAuth2Api;
 		let sslCertificates;
@@ -198,6 +206,12 @@ export class HttpRequestV3 implements INodeType {
 					} else if (genericCredentialType === 'httpCustomAuth') {
 						httpCustomAuth = await this.getCredentials('httpCustomAuth', itemIndex);
 						allowedDomains = getAllowedDomains(this.getNode(), httpCustomAuth);
+					} else if (genericCredentialType === 'httpTemplatedCustomAuth') {
+						httpTemplatedCustomAuth = await this.getCredentials(
+							'httpTemplatedCustomAuth',
+							itemIndex,
+						);
+						allowedDomains = getAllowedDomains(this.getNode(), httpTemplatedCustomAuth);
 					} else if (genericCredentialType === 'oAuth1Api') {
 						oAuth1Api = await this.getCredentials('oAuth1Api', itemIndex);
 						allowedDomains = getAllowedDomains(this.getNode(), oAuth1Api);
@@ -331,9 +345,12 @@ export class HttpRequestV3 implements INodeType {
 				const batchSize = batching?.batch?.batchSize > 0 ? batching?.batch?.batchSize : 1;
 				const batchInterval = batching?.batch.batchInterval;
 
+				// Stop sending requests when the execution is cancelled
+				throwIfExecutionCancelled(this);
+
 				if (itemIndex > 0 && batchSize >= 0 && batchInterval > 0) {
 					if (itemIndex % batchSize === 0) {
-						await sleep(batchInterval);
+						await sleepUnlessExecutionCancelled(this, batchInterval);
 					}
 				}
 
@@ -446,7 +463,7 @@ export class HttpRequestV3 implements INodeType {
 				}
 
 				// Change the way data get send in case a different content-type than JSON got selected
-				if (sendBody && ['PATCH', 'POST', 'PUT', 'GET'].includes(requestMethod)) {
+				if (sendBody && !methodsWithoutBody.includes(requestMethod)) {
 					if (bodyContentType === 'multipart-form-data') {
 						requestOptions.formData = requestOptions.body as IDataObject;
 						delete requestOptions.body;
@@ -528,6 +545,8 @@ export class HttpRequestV3 implements INodeType {
 					requestOptions.useStream = true;
 				} else if (bodyContentType === 'raw') {
 					requestOptions.json = false;
+					// The response arrives as a stream. The paginated helper reads it for paginated requests.
+					// The response loop below reads it for json and text formats.
 					requestOptions.useStream = true;
 				} else {
 					requestOptions.json = true;
@@ -599,6 +618,18 @@ export class HttpRequestV3 implements INodeType {
 					if (customAuth.qs) {
 						requestOptions.qs = { ...requestOptions.qs, ...customAuth.qs };
 						authDataKeys.qs = Object.keys(customAuth.qs);
+					}
+				}
+				if (httpTemplatedCustomAuth !== undefined) {
+					const templatedAuth = applyTemplatedAuth(httpTemplatedCustomAuth, requestOptions);
+					if (templatedAuth.headers) {
+						authDataKeys.headers = Object.keys(templatedAuth.headers);
+					}
+					if (templatedAuth.body) {
+						authDataKeys.body = Object.keys(templatedAuth.body);
+					}
+					if (templatedAuth.qs) {
+						authDataKeys.qs = Object.keys(templatedAuth.qs);
 					}
 				}
 
@@ -783,7 +814,8 @@ export class HttpRequestV3 implements INodeType {
 					requestPromises.push(requestWithAuthentication);
 				}
 			} catch (error) {
-				if (!this.continueOnFail()) throw error;
+				// A cancelled execution must not continue with the next items
+				if (this.getExecutionCancelSignal()?.aborted || !this.continueOnFail()) throw error;
 
 				requestPromises.push(Promise.reject(error).catch(() => {}));
 
@@ -823,7 +855,7 @@ export class HttpRequestV3 implements INodeType {
 									secrets = getSecrets(credentials);
 								}
 								const sanitizedRequestOptions = sanitizeUiMessage(options, authKeys, secrets);
-								sanitizedRequests.push(sanitizedRequestOptions);
+								sanitizedRequests[itemIndex] = sanitizedRequestOptions;
 								this.sendMessageToUI(sanitizedRequestOptions);
 							} catch (e) {}
 						}),
@@ -878,6 +910,15 @@ export class HttpRequestV3 implements INodeType {
 						returnItems.push({
 							json: {
 								error: responseData.reason,
+								...(nodeVersion >= 4.5
+									? {
+											details: createErrorDetails(
+												this.getNode(),
+												responseData.reason as JsonObject,
+												itemIndex,
+											),
+										}
+									: {}),
 							},
 							pairedItem: {
 								item: itemIndex,
@@ -909,18 +950,6 @@ export class HttpRequestV3 implements INodeType {
 				// eslint-disable-next-line prefer-const
 				for (let [index, response] of Object.entries(responses)) {
 					if (response?.request?.constructor.name === 'ClientRequest') delete response.request;
-
-					if (this.getMode() === 'manual' && index === '0') {
-						// For manual executions save the first response in the context
-						// so that we can use it in the frontend and so make it easier for
-						// the users to create the required pagination expressions
-						const nodeContext = this.getContext('node');
-						if (pagination && pagination.paginationMode !== 'off') {
-							nodeContext.response = responseData.value[0];
-						} else {
-							nodeContext.response = responseData.value;
-						}
-					}
 
 					const responseContentType = response.headers['content-type'] ?? '';
 					if (autoDetectResponseFormat) {
@@ -960,6 +989,26 @@ export class HttpRequestV3 implements INodeType {
 							}
 						}
 					}
+
+					// A raw request body streams the response for every format. Read the stream unless
+					// the response is a file. The pagination helper has already read its own stream.
+					if (responseFormat !== 'file' && isStream(response.body)) {
+						response.body = await binaryToStringWithEncodingDetection(
+							response.body as Readable,
+							responseContentType,
+							this.helpers,
+						);
+					}
+
+					if (this.getMode() === 'manual' && index === '0') {
+						// For manual executions save the first response in the context
+						// so that we can use it in the frontend and so make it easier for
+						// the users to create the required pagination expressions.
+						// Save a plain copy after the body is resolved. The execution stores
+						// the context, so it must not hold a response stream.
+						this.getContext('node').response = getResponseForContext(response);
+					}
+
 					// This is a no-op outside of tool usage
 					const optimizeResponse = configureResponseOptimizer(this, itemIndex);
 

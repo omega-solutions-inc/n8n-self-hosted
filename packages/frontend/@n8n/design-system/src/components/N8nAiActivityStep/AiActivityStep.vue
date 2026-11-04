@@ -10,6 +10,7 @@ import N8nAiActivityStepResultSection from '../N8nAiActivityStepResultSection';
 import N8nAnimatedCollapsibleContent from '../N8nAnimatedCollapsibleContent';
 import N8nCallout from '../N8nCallout';
 import N8nIcon from '../N8nIcon';
+import type { IconName } from '../N8nIcon/icons';
 import N8nTooltip from '../N8nTooltip';
 
 const props = withDefaults(
@@ -21,14 +22,25 @@ const props = withDefaults(
 		hasContent?: boolean;
 		/** Wraps slot content in the standard activity data panel. */
 		wrapContent?: boolean;
+		/** Keep error icon/tooltip but skip the inner danger callout. */
+		hideErrorCallout?: boolean;
+		errorIcon?: IconName;
 	}>(),
 	{
 		loading: false,
 		error: undefined,
 		hasContent: true,
 		wrapContent: false,
+		hideErrorCallout: false,
+		errorIcon: 'triangle-alert',
 	},
 );
+
+defineSlots<{
+	default?: () => unknown;
+	/** Replaces the callout text; the tooltip keeps showing `error`. */
+	errorCallout?: () => unknown;
+}>();
 
 const MAX_ERROR_TOOLTIP_LENGTH = 160;
 
@@ -54,7 +66,7 @@ const errorTooltip = computed(() =>
 								<span :class="$style.errorTooltip">{{ errorTooltip }}</span>
 							</template>
 							<N8nIcon
-								icon="triangle-alert"
+								:icon="props.errorIcon"
 								color="danger"
 								size="small"
 								:class="$style.activityErrorIcon"
@@ -71,8 +83,12 @@ const errorTooltip = computed(() =>
 					<slot />
 				</N8nAiActivityStepResultSection>
 				<slot v-else />
-				<N8nCallout v-if="props.error !== undefined" theme="danger" :class="$style.errorCallout">
-					{{ props.error }}
+				<N8nCallout
+					v-if="props.error !== undefined && !props.hideErrorCallout"
+					theme="danger"
+					:class="$style.errorCallout"
+				>
+					<slot name="errorCallout">{{ props.error }}</slot>
 				</N8nCallout>
 			</N8nAnimatedCollapsibleContent>
 		</CollapsibleRoot>
@@ -84,7 +100,7 @@ const errorTooltip = computed(() =>
 						<span :class="$style.errorTooltip">{{ errorTooltip }}</span>
 					</template>
 					<N8nIcon
-						icon="triangle-alert"
+						:icon="props.errorIcon"
 						color="danger"
 						size="small"
 						:class="$style.activityErrorIcon"
@@ -157,6 +173,8 @@ const errorTooltip = computed(() =>
 .errorCallout {
 	margin-top: var(--spacing--xs);
 	max-width: 90%;
+	overflow-wrap: anywhere;
+	word-break: break-word;
 }
 .activityErrorIcon {
 	transform: translateY(1px);

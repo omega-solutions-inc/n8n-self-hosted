@@ -13,6 +13,8 @@ import { validate } from 'jsonschema';
 import type { Entry as LdapUser } from 'ldapts';
 import { randomString } from 'n8n-workflow';
 
+import { UserDeactivationHooks } from '@/services/user-deactivation-hooks.service';
+
 import { BINARY_AD_ATTRIBUTES, LDAP_CONFIG_SCHEMA } from './constants';
 
 /**
@@ -171,21 +173,24 @@ export const processUsers = async (
 	toCreateUsers: Array<[string, User]>,
 	toUpdateUsers: Array<[string, User]>,
 	toDisableUsers: string[],
+	linkExistingAccountsByEmail: boolean,
 ): Promise<void> => {
 	const userRepository = Container.get(UserRepository);
-	const { manager: dbManager } = userRepository;
-	await dbManager.transaction(async (transactionManager) => {
+	await userRepository.runInTransaction({}, async (transactionManager, ctx) => {
 		return await Promise.all([
 			...toCreateUsers.map(async ([ldapId, user]) => {
 				// If a local user already exists with this email (e.g. an email/password
 				// invite that predates LDAP), link the existing user to the LDAP identity
 				// instead of creating a duplicate row and tripping the unique email
-				// constraint — same behaviour as LdapService.handleLogin.
+				// constraint. This matches LdapService.handleLogin. Skip the entry when
+				// linking by email is disabled.
 				const existingUser = await transactionManager.findOne(User, {
 					where: { email: user.email },
 				});
 
 				if (existingUser) {
+					if (!linkExistingAccountsByEmail) return;
+
 					const hasChanges =
 						existingUser.firstName !== user.firstName || existingUser.lastName !== user.lastName;
 
@@ -240,6 +245,7 @@ export const processUsers = async (
 					if (user) {
 						user.disabled = true;
 						await transactionManager.save(user);
+						await Container.get(UserDeactivationHooks).run(user.id, ctx);
 					}
 
 					await transactionManager.delete(AuthIdentity, { userId: authIdentity?.userId });
@@ -254,8 +260,8 @@ export const processUsers = async (
  */
 export const saveLdapSynchronization = async (
 	data: Omit<AuthProviderSyncHistory, 'id' | 'providerType'>,
-): Promise<void> => {
-	await Container.get(AuthProviderSyncHistoryRepository).save(
+): Promise<AuthProviderSyncHistory> => {
+	return await Container.get(AuthProviderSyncHistoryRepository).save(
 		{
 			...data,
 			providerType: 'ldap',
@@ -277,6 +283,22 @@ export const getLdapSynchronizations = async (
 		order: { id: 'DESC' },
 		take: perPage,
 		skip: _page * perPage,
+	});
+};
+
+/**
+ * Retrieve an offset-based page of LDAP synchronizations together with the total count,
+ * for cursor pagination in the public API.
+ */
+export const getLdapSynchronizationsWithCount = async (
+	offset: number,
+	limit: number,
+): Promise<[AuthProviderSyncHistory[], number]> => {
+	return await Container.get(AuthProviderSyncHistoryRepository).findAndCount({
+		where: { providerType: 'ldap' },
+		order: { id: 'DESC' },
+		skip: offset,
+		take: limit,
 	});
 };
 

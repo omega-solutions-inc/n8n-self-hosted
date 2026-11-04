@@ -15,6 +15,7 @@ import { createTestNode } from '@/__tests__/mocks';
 import type { INodeUi } from '@/Interface';
 import { DEFAULT_NEW_WORKFLOW_NAME } from '@/app/constants';
 import type { Workflow } from 'n8n-workflow';
+import { getAuthTypeForNodeCredential, getMainAuthField } from '@/app/utils/nodeTypesUtils';
 
 // Instantiates a store that derives the workflow id from the route. These tests run
 // without a router, so resolve the id directly.
@@ -155,6 +156,59 @@ describe('useWorkflowUpdate', () => {
 			});
 
 			expect(builderStore.setBuilderMadeEdits).toHaveBeenCalledWith(true);
+		});
+
+		it('should strip null optional fields from incoming AI nodes before applying', async () => {
+			const newNode = createTestNode({
+				id: 'new-node-1',
+				name: 'New Node',
+				type: 'n8n-nodes-base.httpRequest',
+			});
+			const nodeWithNulls = {
+				...newNode,
+				parameters: null,
+				credentials: null,
+				webhookId: null,
+				notes: null,
+				notesInFlow: null,
+				executeOnce: null,
+				retryOnFail: null,
+				alwaysOutputData: null,
+				onError: null,
+			};
+
+			mockCanvasOperations.addNodes.mockResolvedValue([newNode as INodeUi]);
+
+			const { updateWorkflow } = useWorkflowUpdate();
+
+			await updateWorkflow({
+				nodes: [nodeWithNulls as unknown as INodeUi],
+				connections: {},
+			});
+
+			expect(mockCanvasOperations.addNodes).toHaveBeenCalledWith(
+				[
+					expect.objectContaining({
+						id: 'new-node-1',
+						name: 'New Node',
+						type: 'n8n-nodes-base.httpRequest',
+					}),
+				],
+				expect.any(Object),
+			);
+			const addedNode = mockCanvasOperations.addNodes.mock.calls[0][0][0] as Record<
+				string,
+				unknown
+			>;
+			expect(addedNode.parameters).toEqual({});
+			expect(addedNode).not.toHaveProperty('credentials');
+			expect(addedNode).not.toHaveProperty('webhookId');
+			expect(addedNode).not.toHaveProperty('notes');
+			expect(addedNode).not.toHaveProperty('notesInFlow');
+			expect(addedNode).not.toHaveProperty('executeOnce');
+			expect(addedNode).not.toHaveProperty('retryOnFail');
+			expect(addedNode).not.toHaveProperty('alwaysOutputData');
+			expect(addedNode).not.toHaveProperty('onError');
 		});
 
 		describe('node categorization', () => {
@@ -595,6 +649,71 @@ describe('useWorkflowUpdate', () => {
 			});
 		});
 
+		describe('deprecated nodes', () => {
+			it('should leave a deprecated node unchanged', async () => {
+				const existingNode = createTestNode({
+					id: 'node-1',
+					name: 'Function',
+					type: 'n8n-nodes-base.function',
+					parameters: { functionCode: 'return items;' },
+				}) as INodeUi;
+				(mockDocumentStore as { allNodes: INodeUi[] }).allNodes = [existingNode];
+				nodeTypesStore.isNodeDeprecated = vi.fn(() => true);
+
+				const { updateWorkflow } = useWorkflowUpdate();
+				await updateWorkflow({
+					nodes: [
+						{
+							...existingNode,
+							name: 'Renamed Function',
+							parameters: { functionCode: 'return [];' },
+						},
+					],
+					connections: {},
+				});
+
+				expect(mockCanvasOperations.renameNode).not.toHaveBeenCalled();
+				expect(mockDocumentStore.setNodes).not.toHaveBeenCalled();
+			});
+
+			it('should move a deprecated node to a type that is not deprecated', async () => {
+				const existingNode = createTestNode({
+					id: 'node-1',
+					name: 'Function',
+					type: 'n8n-nodes-base.function',
+					parameters: { functionCode: 'return items;' },
+				}) as INodeUi;
+				(mockDocumentStore as { allNodes: INodeUi[] }).allNodes = [existingNode];
+				const mockWorkflowObject: Partial<Workflow> = {
+					nodes: { Function: { ...existingNode } },
+					connectionsBySourceNode: {},
+					renameNode: vi.fn(),
+				};
+				vi.mocked(mockDocumentStore.cloneWorkflowObject).mockReturnValue(
+					mockWorkflowObject as Workflow,
+				);
+				nodeTypesStore.isNodeDeprecated = vi.fn(
+					(node: { type: string }) => node.type === 'n8n-nodes-base.function',
+				);
+
+				const { updateWorkflow } = useWorkflowUpdate();
+				await updateWorkflow({
+					nodes: [
+						{
+							...existingNode,
+							type: 'n8n-nodes-base.code',
+							parameters: { jsCode: 'return items;' },
+						},
+					],
+					connections: {},
+				});
+
+				const setNodesCall = vi.mocked(mockDocumentStore.setNodes).mock.calls[0][0];
+				expect(setNodesCall[0].type).toBe('n8n-nodes-base.code');
+				expect(setNodesCall[0].parameters).toEqual({ jsCode: 'return items;' });
+			});
+		});
+
 		describe('parameter change tracking', () => {
 			it('should mark node as dirty when parameters change', async () => {
 				const existingNode = createTestNode({
@@ -872,6 +991,52 @@ describe('useWorkflowUpdate', () => {
 				expect(mockCanvasOperations.addNodes).toHaveBeenCalledWith(
 					[
 						expect.objectContaining({
+							credentials: { httpBasicAuth: { id: 'cred-1', name: 'My Credential' } },
+						}),
+					],
+					expect.any(Object),
+				);
+			});
+
+			it('should coerce null parameters to {} before applying default credentials', async () => {
+				const nodeWithNullParams = {
+					...createTestNode({
+						id: 'node-1',
+						name: 'HTTP Request',
+						type: 'n8n-nodes-base.httpRequest',
+						credentials: undefined,
+					}),
+					parameters: null,
+					credentials: null,
+				};
+
+				const mockCredential = {
+					id: 'cred-1',
+					name: 'My Credential',
+					type: 'httpBasicAuth',
+				};
+
+				nodeTypesStore.getNodeType = vi.fn().mockReturnValue({
+					credentials: [{ name: 'httpBasicAuth' }],
+				});
+				credentialsStore.getCredentialsByType = vi.fn().mockReturnValue([mockCredential]);
+				vi.mocked(getMainAuthField).mockReturnValue({ name: 'authentication' } as never);
+				vi.mocked(getAuthTypeForNodeCredential).mockReturnValue({ value: 'basicAuth' } as never);
+
+				mockCanvasOperations.addNodes.mockResolvedValue([nodeWithNullParams as unknown as INodeUi]);
+
+				const { updateWorkflow } = useWorkflowUpdate();
+
+				const result = await updateWorkflow({
+					nodes: [nodeWithNullParams as unknown as INodeUi],
+					connections: {},
+				});
+
+				expect(result.success).toBe(true);
+				expect(mockCanvasOperations.addNodes).toHaveBeenCalledWith(
+					[
+						expect.objectContaining({
+							parameters: expect.objectContaining({ authentication: 'basicAuth' }),
 							credentials: { httpBasicAuth: { id: 'cred-1', name: 'My Credential' } },
 						}),
 					],

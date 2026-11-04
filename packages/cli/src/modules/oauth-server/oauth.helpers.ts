@@ -47,4 +47,39 @@ export class OAuthHelpers {
 		targetUrl.searchParams.set('iss', issuer);
 		return targetUrl.toString();
 	}
+
+	/**
+	 * Set the RFC 9207 `iss` parameter on an absolute redirect URL, replacing
+	 * any pre-existing value (e.g. one baked into the client's registered
+	 * redirect URI) so the response always asserts this server's identity.
+	 * Relative URLs (internal redirects, e.g. to the consent screen) are
+	 * returned unchanged.
+	 */
+	static setIssuerParam(url: string, issuer: string): string {
+		if (!URL.canParse(url)) return url;
+
+		const targetUrl = new URL(url);
+		targetUrl.searchParams.set('iss', issuer);
+		return targetUrl.toString();
+	}
+
+	/**
+	 * Client id from a `client_secret_basic` Authorization header, which carries
+	 * it as the form-encoded username (RFC 6749 §2.3.1). Returns the username
+	 * only, so the secret never reaches a caller.
+	 */
+	static basicAuthClientId(header?: string): string | undefined {
+		const encoded = /^Basic (\S+)$/i.exec(header ?? '')?.[1];
+		if (!encoded) return undefined;
+
+		const [username] = Buffer.from(encoded, 'base64').toString('utf8').split(':');
+		if (!username) return undefined;
+
+		try {
+			return decodeURIComponent(username);
+		} catch {
+			// A client that did not form-encode its id; report it as sent.
+			return username;
+		}
+	}
 }

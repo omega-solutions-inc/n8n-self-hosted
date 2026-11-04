@@ -16,7 +16,7 @@ import { canvasEventBus } from '@/features/workflows/canvas/canvas.eventBus';
 import { mapLegacyConnectionsToCanvasConnections } from '@/features/workflows/canvas/canvas.utils';
 import { getAuthTypeForNodeCredential, getMainAuthField } from '@/app/utils/nodeTypesUtils';
 import type { WorkflowDataUpdate } from '@n8n/rest-api-client/api/workflows';
-import { NodeHelpers, type IConnections, type INode } from 'n8n-workflow';
+import { NodeHelpers, normalizeNodeShape, type IConnections, type INode } from 'n8n-workflow';
 import isEqual from 'lodash/isEqual';
 
 export interface UpdateWorkflowOptions {
@@ -104,8 +104,12 @@ export function useWorkflowUpdate() {
 	 * which properly updates pinData, nodeMetadata, runData, etc.
 	 */
 	async function updateExistingNodes(
-		nodesToUpdate: Array<{ existing: INodeUi; updated: INode }>,
+		requestedUpdates: Array<{ existing: INodeUi; updated: INode }>,
 	): Promise<boolean> {
+		// The editor freezes deprecated nodes whatever N8N_DEPRECATED_NODES_BLOCK says. Moving one to a type that is not deprecated is allowed.
+		const nodesToUpdate = requestedUpdates.filter(
+			({ updated }) => !nodeTypesStore.isNodeDeprecated(updated),
+		);
 		if (nodesToUpdate.length === 0) return false;
 
 		// Track successful renames (nodeId -> actualNewName after uniquification)
@@ -342,6 +346,12 @@ export function useWorkflowUpdate() {
 		options?: UpdateWorkflowOptions,
 	): Promise<UpdateWorkflowResult> {
 		try {
+			// AI edit round-trips can emit optional INode fields as null; normalize so
+			// they never reach the canvas store or serializeNode (Object.keys(null)).
+			if (workflowData.nodes) {
+				workflowData.nodes = workflowData.nodes.map((node) => normalizeNodeShape(node));
+			}
+
 			// Apply default credentials to incoming nodes BEFORE adding to store
 			setDefaultCredentialsOnNodes(workflowData.nodes ?? []);
 

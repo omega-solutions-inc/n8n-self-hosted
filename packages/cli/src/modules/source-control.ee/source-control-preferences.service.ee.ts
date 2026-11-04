@@ -9,6 +9,8 @@ import { jsonParse, UnexpectedError } from 'n8n-workflow';
 import { readFile, writeFile } from 'node:fs/promises';
 import * as path from 'path';
 
+import { InstanceWriteAccessService } from '@n8n/backend-services';
+
 import {
 	SOURCE_CONTROL_GIT_FOLDER,
 	SOURCE_CONTROL_PREFERENCES_DB_KEY,
@@ -36,6 +38,7 @@ export class SourceControlPreferencesService {
 		private readonly cipher: Cipher,
 		private readonly settingsRepository: SettingsRepository,
 		private readonly sourceControlConfig: SourceControlConfig,
+		private readonly instanceWriteAccess: InstanceWriteAccessService,
 	) {
 		this.sshFolder = path.join(instanceSettings.n8nFolder, SOURCE_CONTROL_SSH_FOLDER);
 		this.gitFolder = path.join(instanceSettings.n8nFolder, SOURCE_CONTROL_GIT_FOLDER);
@@ -55,6 +58,9 @@ export class SourceControlPreferencesService {
 			preferences,
 			this._sourceControlPreferences,
 		);
+		// Mirror into core so consumers can check write access without
+		// depending on this module.
+		this.instanceWriteAccess.setReadOnly(this._sourceControlPreferences.branchReadOnly ?? false);
 	}
 
 	isSourceControlSetup() {
@@ -335,24 +341,34 @@ export class SourceControlPreferencesService {
 		const loadedPreferences = await this.settingsRepository.findOne({
 			where: { key: SOURCE_CONTROL_PREFERENCES_DB_KEY },
 		});
+		let preferences: SourceControlPreferences | undefined;
 		if (loadedPreferences) {
 			try {
-				const preferences = jsonParse<SourceControlPreferences>(loadedPreferences.value);
-				if (preferences) {
-					// set local preferences but don't write back to db and don't broadcast
-					// (this is typically called when receiving a reload event from another instance)
-					await this.setPreferences(preferences, false, false);
-					return preferences;
-				}
+				preferences = jsonParse<SourceControlPreferences>(loadedPreferences.value);
 			} catch (error) {
 				this.logger.warn(
 					`Could not parse Source Control settings from database: ${(error as Error).message}`,
 				);
 			}
 		}
+		if (preferences) {
+			// Written once: a later v1 disconnect must not move the instance to v2.
+			const needsVersion = preferences.environmentsVersion === undefined;
+			if (needsVersion) {
+				preferences.environmentsVersion = preferences.connected ? 'v1' : 'v2';
+			}
+			// set local preferences but don't broadcast
+			// (this is typically called when receiving a reload event from another instance)
+			await this.setPreferences(preferences, needsVersion, false);
+			return preferences;
+		}
 		// Initialize with default preferences, save to DB but don't broadcast
 		// (this is initialization, not a user-initiated change)
-		await this.setPreferences(new SourceControlPreferences(), true, false);
+		await this.setPreferences(
+			new SourceControlPreferences({ environmentsVersion: 'v2' }),
+			true,
+			false,
+		);
 		return this.sourceControlPreferences;
 	}
 }

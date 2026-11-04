@@ -3,7 +3,7 @@ import { Body, Delete, Get, Param, Post, RestController } from '@n8n/decorators'
 import type { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 
-import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+import { ForbiddenError } from '@n8n/errors';
 
 import { InstanceAiMemoryService } from './instance-ai-memory.service';
 import { InstanceAiService } from './instance-ai.service';
@@ -55,7 +55,10 @@ export class InstanceAiTestController {
 		const user = await this.userRepo.findOneByOrFail({ id: payload.userId });
 		const personalProject = await this.projectRepo.getPersonalProjectForUserOrFail(user.id);
 
-		await this.memoryService.ensureThread(user.id, threadId, personalProject.id);
+		await this.memoryService.ensureThread(user.id, threadId, personalProject.id, {
+			source: 'playwright',
+			origin: 'internal',
+		});
 		return await this.instanceAiService.startStuckBackgroundTaskForTest(user, threadId);
 	}
 
