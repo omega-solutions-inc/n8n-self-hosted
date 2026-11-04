@@ -3,9 +3,8 @@ import { GLOBAL_MEMBER_ROLE, type User } from '@n8n/db';
 import jwt from 'jsonwebtoken';
 import { mock } from 'vitest-mock-extended';
 
-import { AuthError } from '@/errors/response-errors/auth.error';
-import { BadRequestError } from '@/errors/response-errors/bad-request.error';
-import type { JwtService } from '@/services/jwt.service';
+import { AuthError, BadRequestError } from '@n8n/errors';
+import type { JwtService } from '@n8n/backend-services';
 
 import type { TokenExchangeConfig } from '../../token-exchange.config';
 import type { ResolvedTrustedKey } from '../../token-exchange.schemas';
@@ -36,6 +35,7 @@ const resolvedKey: ResolvedTrustedKey = {
 	key: 'test-public-key',
 	issuer: 'https://issuer.example.com',
 	allowedRoles: ['global:member', 'global:admin'],
+	requireVerifiedEmail: false,
 };
 
 const mockUser = mock<User>({
@@ -94,7 +94,11 @@ describe('TokenExchangeService', () => {
 			expect(identityResolutionService.resolve).toHaveBeenCalledWith(
 				validClaims,
 				resolvedKey.allowedRoles,
-				{ kid: resolvedKey.kid, issuer: resolvedKey.issuer },
+				{
+					kid: resolvedKey.kid,
+					issuer: resolvedKey.issuer,
+					requireVerifiedEmail: resolvedKey.requireVerifiedEmail,
+				},
 			);
 		});
 

@@ -1,6 +1,6 @@
 import { mock } from 'vitest-mock-extended';
 
-import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+import { ForbiddenError } from '@n8n/errors';
 
 import { McpRegistryTestController } from '../mcp-registry-test.controller';
 import { McpRegistryServerEntity } from '../registry/mcp-registry-server.entity';
@@ -68,10 +68,13 @@ describe('McpRegistryTestController', () => {
 			await expect(controller.seed()).rejects.toThrow(ForbiddenError);
 		});
 
-		it('should throw ForbiddenError in production even when E2E_TESTS is set', async () => {
+		it('should seed when NODE_ENV is production and E2E_TESTS is set', async () => {
 			process.env.NODE_ENV = 'production';
+			service.handleReloadMcpRegistry.mockResolvedValue();
 
-			await expect(controller.seed()).rejects.toThrow(ForbiddenError);
+			const result = await controller.seed();
+
+			expect(result).toEqual({ ok: true, count: 2 });
 		});
 	});
 });

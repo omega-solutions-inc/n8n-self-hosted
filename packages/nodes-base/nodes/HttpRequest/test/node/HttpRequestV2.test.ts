@@ -101,6 +101,15 @@ describe('HttpRequestV2', () => {
 				authValue: { Token: 'secretToken' },
 			},
 			{
+				genericCredentialType: 'httpTemplatedCustomAuth',
+				credentials: {
+					template: JSON.stringify({ headers: { Authorization: 'Bearer {{api_key}}' } }),
+					placeholderValues: JSON.stringify({ api_key: 'templatedToken' }),
+				},
+				authField: 'headers',
+				authValue: { Authorization: 'Bearer templatedToken' },
+			},
+			{
 				genericCredentialType: 'oAuth1Api',
 				credentials: { oauth_token: 'token', oauth_token_secret: 'secret' },
 				authField: 'oauth',
@@ -155,6 +164,7 @@ describe('HttpRequestV2', () => {
 					expect(executeFunctions.helpers.request).toHaveBeenCalledWith(
 						expect.objectContaining({
 							[authField]: expect.objectContaining(authValue),
+							sendCredentialsOnCrossOriginRedirect: true,
 						}),
 					);
 				}
@@ -257,6 +267,62 @@ describe('HttpRequestV2', () => {
 			await expect(node.execute.call(executeFunctions)).rejects.toThrow(
 				`URL parameter must be a string, got ${expectedType}`,
 			);
+		});
+	});
+
+	describe('Raw request body', () => {
+		const setupRawBody = (responseFormat: string) => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation(
+				(paramName: string, _itemIndex?: number, fallback?: unknown) => {
+					switch (paramName) {
+						case 'responseFormat':
+							return responseFormat;
+						case 'requestMethod':
+							return 'POST';
+						case 'url':
+							return baseUrl;
+						case 'authentication':
+							return 'none';
+						case 'jsonParameters':
+							return false;
+						case 'options':
+							return { ...options, response: undefined, bodyContentType: 'raw' };
+						case 'dataPropertyName':
+							return 'data';
+						case 'bodyParametersUi':
+						case 'headerParametersUi':
+						case 'queryParametersUi':
+							return { parameter: [] };
+						default:
+							return fallback;
+					}
+				},
+			);
+		};
+
+		it.each(['json', 'string'])(
+			'should not request a stream for the %s response format',
+			async (responseFormat) => {
+				setupRawBody(responseFormat);
+				(executeFunctions.helpers.request as Mock).mockResolvedValue('{"a":1}');
+
+				await node.execute.call(executeFunctions);
+
+				const requestOptions = (executeFunctions.helpers.request as Mock).mock.calls[0][0] as {
+					useStream?: boolean;
+				};
+				expect(requestOptions.useStream).toBeUndefined();
+			},
+		);
+
+		it('should return the parsed body for the json response format', async () => {
+			setupRawBody('json');
+			(executeFunctions.helpers.request as Mock).mockResolvedValue('{"a":1}');
+
+			const result = await node.execute.call(executeFunctions);
+
+			expect(result).toEqual([[{ json: { a: 1 }, pairedItem: { item: 0 } }]]);
 		});
 	});
 });

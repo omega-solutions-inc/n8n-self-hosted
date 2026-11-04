@@ -24,7 +24,14 @@ function googleSheetsConfig(workflowId: string): EvaluationConfigDto {
 				id: 'metric-2',
 				name: 'Correctness',
 				type: 'llm_judge',
-				config: { preset: 'correctness' },
+				config: {
+					preset: 'correctness',
+					provider: '@n8n/n8n-nodes-langchain.lmChatOpenAi',
+					credentialId: 'cred-judge',
+					model: 'gpt-4.1',
+					outputType: 'numeric',
+					inputs: { actualAnswer: '={{ $json.actual }}', expectedAnswer: '={{ $json.expected }}' },
+				},
 			},
 		],
 		datasetSource: 'google_sheets',
@@ -123,6 +130,31 @@ describe('configEvalHandler', () => {
 		expect(getPersonalProjectId).not.toHaveBeenCalled();
 		expect(getDataTableColumns).not.toHaveBeenCalled();
 		expect(getDataTableRows).not.toHaveBeenCalled();
+	});
+
+	it('fetch() reads the dataset table from the project the ref names', async () => {
+		const workflowId = 'wf-3';
+		const dataTableId = 'dt-3';
+		const getPersonalProjectId: Mock = vi.fn();
+		const getDataTableColumns: Mock = vi.fn().mockResolvedValue([]);
+		const getDataTableRows: Mock = vi.fn().mockResolvedValue({ count: 0, data: [] });
+		const client = {
+			getWorkflowEvaluationConfigs: vi
+				.fn()
+				.mockResolvedValue([dataTableConfig(workflowId, dataTableId)]),
+			getPersonalProjectId,
+			getDataTableColumns,
+			getDataTableRows,
+		} as unknown as N8nClient;
+
+		await configEvalHandler.fetch(
+			{ type: 'config-eval', id: workflowId, projectId: 'build-project' },
+			client,
+		);
+
+		expect(getDataTableColumns).toHaveBeenCalledWith('build-project', dataTableId);
+		expect(getDataTableRows).toHaveBeenCalledWith('build-project', dataTableId);
+		expect(getPersonalProjectId).not.toHaveBeenCalled();
 	});
 
 	it('renderArtifact() surfaces config + dataset detail and never mentions the owning workflow', () => {

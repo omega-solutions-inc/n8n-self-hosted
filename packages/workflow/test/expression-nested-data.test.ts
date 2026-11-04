@@ -87,4 +87,37 @@ describe('Expression — nested $json shapes (engine parity)', () => {
 			list: [[1, 2], { k: 'v' }],
 		});
 	});
+
+	it('spreads $json into an object literal', () => {
+		expect(evaluate('={{ {...$json} }}', { name: 'alice', age: 30 })).toEqual({
+			name: 'alice',
+			age: 30,
+		});
+	});
+
+	it('overrides a property of a spread $json', () => {
+		expect(evaluate('={{ {...$json, age: 31} }}', { name: 'alice', age: 30 })).toEqual({
+			name: 'alice',
+			age: 31,
+		});
+	});
+
+	it('spreads a nested array from $json', () => {
+		expect(evaluate('={{ [...$json.rows] }}', { rows: [1, 2, 3] })).toEqual([1, 2, 3]);
+	});
+
+	it('keeps an undefined object value in the result', () => {
+		expect(evaluate('={{ { a: undefined, b: 1 } }}', {})).toStrictEqual({ a: undefined, b: 1 });
+	});
+
+	it('keeps an undefined array item in the result', () => {
+		expect(evaluate('={{ [1, undefined, 3] }}', {})).toStrictEqual([1, undefined, 3]);
+	});
+
+	it('keeps undefined values nested in the result', () => {
+		expect(evaluate('={{ { list: [undefined], inner: { a: undefined } } }}', {})).toStrictEqual({
+			list: [undefined],
+			inner: { a: undefined },
+		});
+	});
 });

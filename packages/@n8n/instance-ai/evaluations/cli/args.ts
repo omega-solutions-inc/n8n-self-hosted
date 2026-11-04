@@ -34,7 +34,9 @@ function resolveBuildModel(env: NodeJS.ProcessEnv = process.env): string {
 // ---------------------------------------------------------------------------
 
 export interface CliArgs {
-	/** TimeoutMs is defined per iteration, not as the total timeout for all iterations */
+	/** Budget of one unit of work: one user turn of the build conversation, or one
+	 *  scenario execution attempt. A conversation may spend `CONVERSATION_BUDGET_TURNS`
+	 *  of these in total (harness/timeouts.ts). Not a total for all iterations. */
 	timeoutMs: number;
 	/** One or more n8n base URLs. Multi-lane runs use a work-stealing allocator
 	 *  that dispatches each build to a lane that isn't already running its
@@ -63,6 +65,9 @@ export interface CliArgs {
 	outputDir?: string;
 	/** LangSmith dataset name (synced from JSON test cases before each run) */
 	dataset: string;
+	/** True when `--source langtracer` auto-forked the dataset name off the suite
+	 *  (no explicit --dataset) — cohort isolation, surfaced loudly by the driver. */
+	datasetAutoForked: boolean;
 	/** Max concurrent target() calls in LangSmith evaluate(). Build concurrency is
 	 *  enforced separately by the LaneAllocator (cap=4 per lane). */
 	concurrency: number;
@@ -124,7 +129,7 @@ export interface CliArgs {
 // ---------------------------------------------------------------------------
 
 const cliArgsSchema = z.object({
-	// Keep in sync with DEFAULT_TIMEOUT_MS in harness/runner.ts (and its
+	// Keep in sync with DEFAULT_TIMEOUT_MS in harness/build-workflow.ts (and its
 	// rationale for why this default must stay conservative).
 	timeoutMs: z.number().int().positive().default(900_000),
 	baseUrls: z.array(z.string().url()).min(1).default(['http://localhost:5678']),
@@ -212,13 +217,17 @@ export function parseCliArgs(argv: string[]): CliArgs {
 	// In langtracer mode, default the dataset + baseline to a suite-scoped, eval-tagged
 	// name so runs don't pollute the shared cohort and re-runs upsert one stable dataset.
 	let dataset = validated.dataset;
+	let datasetAutoForked = false;
 	let baselinePrefix = validated.baselinePrefix;
 	if (validated.source === 'langtracer' && validated.suite) {
 		const suiteSlug = validated.suite
 			.toLowerCase()
 			.replace(/[^a-z0-9]+/g, '-')
 			.replace(/^-+|-+$/g, '');
-		if (!raw.datasetProvided) dataset = `instance-ai-langtracer-${suiteSlug}`;
+		if (!raw.datasetProvided) {
+			dataset = `instance-ai-langtracer-${suiteSlug}`;
+			datasetAutoForked = true;
+		}
 		if (!raw.baselineProvided) baselinePrefix = `instance-ai-langtracer-${suiteSlug}-baseline-`;
 	}
 
@@ -235,6 +244,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
 		deletePrebuiltWorkflows: validated.deletePrebuiltWorkflows,
 		outputDir: validated.outputDir,
 		dataset,
+		datasetAutoForked,
 		concurrency: validated.concurrency,
 		experimentName: validated.experimentName,
 		iterations: validated.iterations,

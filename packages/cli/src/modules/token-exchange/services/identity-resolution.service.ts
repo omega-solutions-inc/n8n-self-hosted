@@ -1,4 +1,5 @@
 import { Logger } from '@n8n/backend-common';
+import { EventService, RoleService } from '@n8n/backend-services';
 import {
 	AuthIdentity,
 	AuthIdentityRepository,
@@ -7,13 +8,12 @@ import {
 	type User,
 } from '@n8n/db';
 import { Service } from '@n8n/di';
-import { isBuiltInRole } from '@n8n/permissions';
+import { GLOBAL_OWNER_ROLE_SLUG, isBuiltInRole } from '@n8n/permissions';
 import { createHash } from 'node:crypto';
 
-import { EventService } from '@/events/event.service';
-import { RoleService } from '@/services/role.service';
 import { UserService } from '@/services/user.service';
 
+import { TokenExchangeConfig } from '../token-exchange.config';
 import { TokenExchangeAuthError } from '../token-exchange.errors';
 import type { ExternalTokenClaims } from '../token-exchange.schemas';
 import { TokenExchangeFailureReason } from '../token-exchange.types';
@@ -49,8 +49,36 @@ export class IdentityResolutionService {
 		private readonly userService: UserService,
 		private readonly trustedKeyService: TrustedKeyService,
 		private readonly roleService: RoleService,
+		private readonly config: TokenExchangeConfig,
 	) {
 		this.logger = logger.scoped('token-exchange');
+	}
+
+	private assertKeyMayActAsUser(user: User, allowedRoles?: string[]) {
+		if (this.config.excludeOwner && user.role?.slug === GLOBAL_OWNER_ROLE_SLUG) {
+			throw new TokenExchangeAuthError(
+				TokenExchangeFailureReason.RoleNotAllowed,
+				'User role is not allowed for this key',
+			);
+		}
+		if (allowedRoles?.length && !allowedRoles.includes(user.role?.slug ?? '')) {
+			throw new TokenExchangeAuthError(
+				TokenExchangeFailureReason.RoleNotAllowed,
+				'User role is not allowed for this key',
+			);
+		}
+	}
+
+	private assertEmailVerified(
+		claims: ExternalTokenClaims,
+		tokenContext: { requireVerifiedEmail: boolean },
+	) {
+		if (tokenContext?.requireVerifiedEmail && !claims.email_verified) {
+			throw new TokenExchangeAuthError(
+				TokenExchangeFailureReason.EmailNotVerified,
+				'Email is not verified',
+			);
+		}
 	}
 
 	/**
@@ -67,8 +95,8 @@ export class IdentityResolutionService {
 	 */
 	async resolve(
 		claims: ExternalTokenClaims,
-		allowedRoles?: string[],
-		tokenContext?: { kid: string; issuer: string },
+		allowedRoles: string[] | undefined,
+		tokenContext: { kid: string; issuer: string; requireVerifiedEmail: boolean },
 	): Promise<User> {
 		const email = claims.email?.toLowerCase();
 
@@ -97,8 +125,8 @@ export class IdentityResolutionService {
 			this.eventService.emit('token-exchange-identity-rebound', {
 				userId: identity.user.id,
 				sub: claims.sub,
-				kid: tokenContext?.kid ?? '',
-				issuer: tokenContext?.issuer ?? claims.iss,
+				kid: tokenContext.kid,
+				issuer: tokenContext.issuer,
 			});
 			return await this.resolveByIdentity(claims, identity, allowedRoles, tokenContext);
 		}
@@ -131,8 +159,10 @@ export class IdentityResolutionService {
 		claims: ExternalTokenClaims,
 		identity: AuthIdentity,
 		allowedRoles: string[] | undefined,
-		tokenContext: { kid: string; issuer: string } | undefined,
+		tokenContext: { kid: string; issuer: string; requireVerifiedEmail: boolean } | undefined,
 	): Promise<User> {
+		this.assertKeyMayActAsUser(identity.user, allowedRoles);
+
 		this.logger.debug('Resolved user by auth identity', { sub: claims.sub });
 		const resolvedRole = await this.resolveRoleForExistingUser(
 			claims.role,
@@ -148,12 +178,14 @@ export class IdentityResolutionService {
 		email: string,
 		existingUser: User,
 		allowedRoles: string[] | undefined,
-		tokenContext: { kid: string; issuer: string } | undefined,
+		tokenContext: { kid: string; issuer: string; requireVerifiedEmail: boolean },
 	): Promise<User> {
 		this.logger.debug('Linking external identity to existing user by email', {
 			sub: claims.sub,
 			email,
 		});
+		this.assertKeyMayActAsUser(existingUser, allowedRoles);
+		this.assertEmailVerified(claims, tokenContext);
 		const resolvedRole = await this.resolveRoleForExistingUser(
 			claims.role,
 			allowedRoles,
@@ -178,8 +210,9 @@ export class IdentityResolutionService {
 		claims: ExternalTokenClaims,
 		email: string,
 		allowedRoles: string[] | undefined,
-		tokenContext: { kid: string; issuer: string } | undefined,
+		tokenContext: { kid: string; issuer: string; requireVerifiedEmail: boolean },
 	): Promise<User> {
+		this.assertEmailVerified(claims, tokenContext);
 		this.logger.debug('JIT provisioning new user', { sub: claims.sub, email });
 
 		const jitRole = await this.resolveRoleForNewUser(claims.role, allowedRoles);
@@ -334,7 +367,7 @@ export class IdentityResolutionService {
 		user: User,
 		claims: ExternalTokenClaims,
 		resolvedRole?: string,
-		tokenContext?: { kid: string; issuer: string },
+		tokenContext?: { kid: string; issuer: string; requireVerifiedEmail: boolean },
 	): Promise<User> {
 		let needsReload = false;
 
@@ -356,6 +389,7 @@ export class IdentityResolutionService {
 		}
 
 		if (Object.keys(profileUpdates).length > 0) {
+			// oxlint-disable-next-line typescript/no-deprecated
 			await this.userRepository.update(user.id, profileUpdates);
 			needsReload = true;
 		}

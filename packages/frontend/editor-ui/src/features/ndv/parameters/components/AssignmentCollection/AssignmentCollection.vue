@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useDebounce } from '@/app/composables/useDebounce';
+import { useDebounce } from '@n8n/composables/useDebounce';
 import { useI18n } from '@n8n/i18n';
 import { injectNDVStore } from '@/features/ndv/shared/ndv.store';
 import isEqual from 'lodash/isEqual';
@@ -171,10 +171,15 @@ function optionSelected(action: string) {
 
 <template>
 	<div
-		:class="{ [$style.assignmentCollection]: true, [$style.empty]: empty }"
+		:class="{
+			[$style.assignmentCollection]: true,
+			[$style.empty]: empty,
+			[$style.restricted]: hasRestrictedAssignments,
+		}"
 		:data-test-id="`assignment-collection-${parameter.name}`"
 	>
 		<N8nInputLabel
+			v-if="!hasRestrictedAssignments"
 			:label="parameter.displayName"
 			:show-expression-selector="false"
 			size="small"
@@ -296,6 +301,10 @@ function optionSelected(action: string) {
 	padding-left: var(--spacing--lg);
 }
 
+.restricted .assignments {
+	gap: var(--spacing--xs);
+}
+
 .dropAreaWrapper {
 	cursor: pointer;
 
@@ -334,11 +343,11 @@ function optionSelected(action: string) {
 
 .add {
 	color: var(--color--primary);
-	font-weight: var(--font-weight--bold);
+	font-weight: var(--font-weight--medium);
 }
 
 .activeField {
-	font-weight: var(--font-weight--bold);
+	font-weight: var(--font-weight--medium);
 	color: var(--ndv--droppable-parameter--color);
 }
 

@@ -1,7 +1,18 @@
 import FormData from 'form-data';
-import type { IExecuteFunctions, INodeTypeBaseDescription } from 'n8n-workflow';
+import { IncomingMessage } from 'http';
+import { NodeHelpers } from 'n8n-workflow';
+import { Socket } from 'net';
+import type {
+	IExecuteFunctions,
+	INodeParameters,
+	INodePropertyOptions,
+	INodeTypeBaseDescription,
+	JsonObject,
+	JsonValue,
+} from 'n8n-workflow';
 
 import { HttpRequestV3 } from '../../V3/HttpRequestV3.node';
+import { createErrorDetails } from '../../V3/utils/error-details';
 import type { Mock } from 'vitest';
 
 describe('HttpRequestV3', () => {
@@ -70,7 +81,169 @@ describe('HttpRequestV3', () => {
 			sendMessageToUI: vi.fn(),
 			continueOnFail: vi.fn(),
 			getMode: vi.fn(),
+			getExecutionCancelSignal: vi.fn(),
 		} as unknown as IExecuteFunctions;
+	});
+
+	describe('Method dropdown', () => {
+		const webdavMethods = ['PROPFIND', 'MKCOL', 'MOVE', 'COPY', 'REPORT'];
+
+		const visibleMethods = (nodeParameters: INodeParameters) => {
+			const methodProperty = node.description.properties.find((p) => p.name === 'method');
+			expect(methodProperty?.type).toBe('options');
+
+			return ((methodProperty?.options ?? []) as INodePropertyOptions[])
+				.filter((option) => NodeHelpers.displayParameter(nodeParameters, option, null, null))
+				.map((option) => option.value);
+		};
+
+		it('should hide WebDAV methods until the option is enabled', () => {
+			const visible = visibleMethods({ method: 'GET', options: {} });
+
+			expect(visible).toEqual(expect.arrayContaining(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']));
+			for (const method of webdavMethods) {
+				expect(visible).not.toContain(method);
+			}
+		});
+
+		it('should show WebDAV methods once the option is enabled', () => {
+			const visible = visibleMethods({ method: 'GET', options: { webdavMethods: true } });
+
+			for (const method of webdavMethods) {
+				expect(visible.filter((value) => value === method)).toEqual([method]);
+			}
+		});
+
+		it.each(webdavMethods)(
+			'should keep %s visible when it is selected but the option is disabled',
+			(method) => {
+				const visible = visibleMethods({ method, options: {} });
+
+				expect(visible.filter((value) => value === method)).toEqual([method]);
+
+				for (const other of webdavMethods.filter((m) => m !== method)) {
+					expect(visible).not.toContain(other);
+				}
+			},
+		);
+
+		it('should not duplicate a selected WebDAV method when the option is enabled', () => {
+			const visible = visibleMethods({ method: 'PROPFIND', options: { webdavMethods: true } });
+
+			expect(visible.filter((value) => value === 'PROPFIND')).toEqual(['PROPFIND']);
+		});
+
+		it('should not duplicate WebDAV methods when Method holds an expression', () => {
+			const visible = visibleMethods({
+				method: '={{ $json.method }}',
+				options: { webdavMethods: true },
+			});
+
+			for (const method of webdavMethods) {
+				expect(visible.filter((value) => value === method)).toEqual([method]);
+			}
+		});
+	});
+
+	it('should add an "Enable WebDAV Methods" option to Options, disabled by default', () => {
+		const optionsProperty = node.description.properties.find((p) => p.name === 'options');
+		expect(optionsProperty).toBeDefined();
+
+		const webdavOption = (optionsProperty?.options ?? []).find((o) => o.name === 'webdavMethods');
+		expect(webdavOption).toMatchObject({
+			displayName: 'Enable WebDAV Methods',
+			type: 'boolean',
+			default: false,
+		});
+	});
+
+	it.each(['PROPFIND', 'MKCOL', 'MOVE', 'COPY', 'REPORT'])(
+		'should make a %s request',
+		async (method) => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation((paramName: string) => {
+				switch (paramName) {
+					case 'method':
+						return method;
+					case 'url':
+						return baseUrl;
+					case 'authentication':
+						return 'none';
+					case 'options':
+						return options;
+					default:
+						return undefined;
+				}
+			});
+
+			const response = {
+				headers: { 'content-type': 'application/json' },
+				body: Buffer.from(JSON.stringify({ success: true })),
+			};
+			(executeFunctions.helpers.request as Mock).mockResolvedValue(response);
+
+			await node.execute.call(executeFunctions);
+
+			expect(executeFunctions.helpers.request).toHaveBeenCalledWith(
+				expect.objectContaining({
+					method,
+					uri: baseUrl,
+				}),
+			);
+		},
+	);
+
+	describe('Body content-type conversion per method', () => {
+		const executeFormRequest = async (method: string) => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation((paramName: string) => {
+				switch (paramName) {
+					case 'method':
+						return method;
+					case 'url':
+						return baseUrl;
+					case 'authentication':
+						return 'none';
+					case 'sendBody':
+						return true;
+					case 'contentType':
+						return 'form-urlencoded';
+					case 'specifyBody':
+						return 'keypair';
+					case 'bodyParameters.parameters':
+						// eslint-disable-next-line n8n-nodes-base/node-param-display-name-miscased
+						return [{ name: 'depth', value: '1' }];
+					case 'options':
+						return options;
+					default:
+						return undefined;
+				}
+			});
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				headers: { 'content-type': 'application/json' },
+				body: Buffer.from(JSON.stringify({ success: true })),
+			});
+
+			await node.execute.call(executeFunctions);
+			return (executeFunctions.helpers.request as Mock).mock.calls[0][0];
+		};
+
+		it('should convert the body for WebDAV methods that send one', async () => {
+			const requestArgs = await executeFormRequest('PROPFIND');
+			expect(requestArgs.form).toEqual({ depth: '1' });
+			expect(requestArgs.body).toBeUndefined();
+		});
+
+		it('should keep converting the body for GET requests', async () => {
+			const requestArgs = await executeFormRequest('GET');
+			expect(requestArgs.form).toEqual({ depth: '1' });
+			expect(requestArgs.body).toBeUndefined();
+		});
+
+		it('should not convert the body for methods that never carry one', async () => {
+			const requestArgs = await executeFormRequest('HEAD');
+			expect(requestArgs.form).toBeUndefined();
+		});
 	});
 
 	it('should make a GET request', async () => {
@@ -99,6 +272,59 @@ describe('HttpRequestV3', () => {
 		const result = await node.execute.call(executeFunctions);
 
 		expect(result).toEqual([[{ json: { success: true }, pairedItem: { item: 0 } }]]);
+	});
+
+	describe('Batching and execution cancellation', () => {
+		const mockThreeItems = (batchInterval: number) => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([
+				{ json: {} },
+				{ json: {} },
+				{ json: {} },
+			]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation((paramName: string) => {
+				switch (paramName) {
+					case 'method':
+						return 'GET';
+					case 'url':
+						return baseUrl;
+					case 'authentication':
+						return 'none';
+					case 'options':
+						return { ...options, batching: { batch: { batchSize: 1, batchInterval } } };
+					default:
+						return undefined;
+				}
+			});
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				headers: { 'content-type': 'application/json' },
+				body: Buffer.from(JSON.stringify({ success: true })),
+			});
+		};
+
+		it('should stop sending requests when the execution is cancelled during the batch interval', async () => {
+			mockThreeItems(60_000);
+			const controller = new AbortController();
+			(executeFunctions.getExecutionCancelSignal as Mock).mockReturnValue(controller.signal);
+
+			const execution = node.execute.call(executeFunctions);
+			setTimeout(() => controller.abort(), 10);
+
+			await expect(execution).rejects.toThrow('The execution was canceled');
+			expect(executeFunctions.helpers.request).toHaveBeenCalledTimes(1);
+		});
+
+		it('should not continue with the next items when "Continue On Fail" is enabled', async () => {
+			mockThreeItems(60_000);
+			(executeFunctions.continueOnFail as Mock).mockReturnValue(true);
+			const controller = new AbortController();
+			(executeFunctions.getExecutionCancelSignal as Mock).mockReturnValue(controller.signal);
+
+			const execution = node.execute.call(executeFunctions);
+			setTimeout(() => controller.abort(), 10);
+
+			await expect(execution).rejects.toThrow('The execution was canceled');
+			expect(executeFunctions.helpers.request).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	it('should handle authentication', async () => {
@@ -642,6 +868,233 @@ describe('HttpRequestV3', () => {
 			const result = await node.execute.call(executeFunctions);
 
 			expect(result).toEqual([[{ json: {}, pairedItem: { item: 0 } }]]);
+		});
+	});
+
+	describe('Continued request errors', () => {
+		beforeEach(() => {
+			(executeFunctions.getNode as Mock).mockReturnValue({
+				typeVersion: 4.5,
+			});
+		});
+
+		it('should return null details if response parsing fails', () => {
+			const requestError: JsonObject = {};
+			Object.defineProperty(requestError, 'response', {
+				get: () => {
+					throw new Error('Unable to read response');
+				},
+			});
+
+			expect(createErrorDetails(executeFunctions.getNode(), requestError, 0)).toBeNull();
+		});
+
+		it('should use the body from a legacy request error', () => {
+			const responseBody = { error: 'Bad Request' };
+			const requestError: JsonObject = {
+				statusCode: 400,
+				error: responseBody,
+				response: {
+					headers: { 'x-request-id': 'request-1' },
+					status: 400,
+				},
+			};
+
+			expect(createErrorDetails(executeFunctions.getNode(), requestError, 0)).toMatchObject({
+				httpCode: '400',
+				body: responseBody,
+				context: { itemIndex: 0 },
+			});
+		});
+
+		const errorResponseBodies: Array<{
+			name: string;
+			body: JsonValue | Buffer;
+			expectedBody: JsonValue;
+		}> = [
+			{
+				name: 'an object response body',
+				body: { error: 'Bad Request' },
+				expectedBody: { error: 'Bad Request' },
+			},
+			{
+				name: 'a JSON response body encoded as text',
+				body: '{"error":"Bad Request"}',
+				expectedBody: { error: 'Bad Request' },
+			},
+			{
+				name: 'a plain-text response body',
+				body: 'The supplied value is invalid',
+				expectedBody: 'The supplied value is invalid',
+			},
+			{
+				name: 'a Buffer-backed response body',
+				body: Buffer.from('{"error":"Bad Request"}'),
+				expectedBody: { error: 'Bad Request' },
+			},
+			{
+				name: 'a null response body',
+				body: null,
+				expectedBody: null,
+			},
+			{
+				name: 'an array response body',
+				body: ['Bad Request'],
+				expectedBody: ['Bad Request'],
+			},
+			{
+				name: 'an invalid JSON response body',
+				body: '{"error":"Bad Request"',
+				expectedBody: '{"error":"Bad Request"',
+			},
+		];
+
+		it.each(errorResponseBodies)(
+			'should expose $name without changing the legacy error',
+			async ({ body, expectedBody }) => {
+				(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+				(executeFunctions.continueOnFail as Mock).mockReturnValue(true);
+				(executeFunctions.getNodeParameter as Mock).mockImplementation((paramName: string) => {
+					switch (paramName) {
+						case 'method':
+							return 'GET';
+						case 'url':
+							return baseUrl;
+						case 'authentication':
+							return 'none';
+						case 'options':
+							return options;
+						default:
+							return undefined;
+					}
+				});
+
+				const requestError = {
+					message: 'Request failed with status code 400',
+					name: 'RequestError',
+					status: 400,
+					statusCode: 400,
+					response: {
+						headers: { 'x-request-id': 'request-1' },
+						data: body,
+					},
+				};
+				(executeFunctions.helpers.request as Mock).mockRejectedValue(requestError);
+
+				const result = await node.execute.call(executeFunctions);
+				const expectedContext = {
+					itemIndex: 0,
+					...(body !== null &&
+						!Buffer.isBuffer(body) &&
+						!Array.isArray(body) &&
+						typeof body === 'object' && {
+							data: body,
+						}),
+				};
+
+				expect(result[0][0]).toMatchObject({
+					json: {
+						error: requestError,
+						details: {
+							httpCode: '400',
+							body: expectedBody,
+							context: expectedContext,
+						},
+					},
+					pairedItem: { item: 0 },
+				});
+				expect(Object.keys(result[0][0].json)).toEqual(['error', 'details']);
+			},
+		);
+
+		it('should retain the matching response body when requests complete out of order', async () => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }, { json: {} }]);
+			(executeFunctions.continueOnFail as Mock).mockReturnValue(true);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation(
+				(paramName: string, itemIndex: number) => {
+					switch (paramName) {
+						case 'method':
+							return 'GET';
+						case 'url':
+							return `${baseUrl}/${itemIndex}`;
+						case 'authentication':
+							return 'none';
+						case 'options':
+							return options;
+						default:
+							return undefined;
+					}
+				},
+			);
+
+			(executeFunctions.helpers.request as Mock).mockImplementation(
+				async (requestOptions: { uri: string }) =>
+					await new Promise((_, reject) => {
+						const delay = requestOptions.uri.endsWith('/0') ? 10 : 0;
+						setTimeout(() => {
+							reject({
+								message: 'Request failed',
+								statusCode: 400,
+								response: { data: { request: requestOptions.uri } },
+							});
+						}, delay);
+					}),
+			);
+
+			const result = await node.execute.call(executeFunctions);
+
+			expect(result[0][0].json.details).toMatchObject({
+				body: { request: `${baseUrl}/0` },
+			});
+			expect(result[0][1].json.details).toMatchObject({
+				body: { request: `${baseUrl}/1` },
+			});
+		});
+
+		it('should retain the matching sanitized request when requests complete out of order', async () => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }, { json: {} }]);
+			(executeFunctions.continueOnFail as Mock).mockReturnValue(false);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation(
+				(paramName: string, itemIndex: number) => {
+					switch (paramName) {
+						case 'method':
+							return 'GET';
+						case 'url':
+							return `${baseUrl}/${itemIndex}`;
+						case 'authentication':
+							return 'none';
+						case 'options':
+							return {
+								...options,
+								batching: { batch: { batchSize: 1, batchInterval: 0 } },
+							};
+						default:
+							return undefined;
+					}
+				},
+			);
+
+			const rejectRequests: Array<(error: Error) => void> = [];
+			(executeFunctions.helpers.request as Mock).mockImplementation(
+				async () =>
+					await new Promise((_, reject) => {
+						rejectRequests.push(reject);
+					}),
+			);
+
+			const execution = node.execute.call(executeFunctions);
+			const requestError = Object.assign(new Error('Request failed'), { statusCode: 400 });
+			rejectRequests[1](requestError);
+			rejectRequests[0](requestError);
+
+			await expect(execution).rejects.toMatchObject({
+				context: {
+					itemIndex: 0,
+					request: {
+						uri: `${baseUrl}/0`,
+					},
+				},
+			});
 		});
 	});
 
@@ -1207,6 +1660,352 @@ describe('HttpRequestV3', () => {
 			expect(result[0][0].json.error).toBeDefined();
 			// Item 1 → valid response, no crash
 			expect(result[0][1].json.ok).toBe(true);
+		});
+	});
+
+	describe('Node context on manual runs', () => {
+		const REQUEST_HEADER = 'X-Custom-Header: custom-value';
+
+		// A response stream references its socket, and the socket references the raw request headers.
+		const createStreamWithRequestHeaders = () => {
+			const socket = new Socket();
+			Object.assign(socket, {
+				_httpMessage: { _header: `GET /photo/1 HTTP/1.1\r\n${REQUEST_HEADER}\r\n` },
+			});
+			return new IncomingMessage(socket);
+		};
+
+		let nodeContext: Record<string, unknown>;
+
+		const paginationOptions = {
+			paginationMode: 'responseContainsNextURL',
+			nextURL: '={{ $response.body.next }}',
+			paginationCompleteWhen: 'responseIsEmpty',
+			statusCodesWhenComplete: '',
+			completeExpression: '',
+			limitPagesFetched: false,
+			maxRequests: 10,
+			requestInterval: 0,
+		};
+
+		const setup = (responseOptions: Record<string, unknown>, pagination?: unknown) => {
+			nodeContext = {};
+			(executeFunctions.getMode as Mock).mockReturnValue('manual');
+			(executeFunctions.getContext as Mock).mockReturnValue(nodeContext);
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation(
+				(paramName: string, _itemIndex: number, fallback: unknown) => {
+					switch (paramName) {
+						case 'url':
+							return baseUrl;
+						case 'method':
+							return 'GET';
+						case 'authentication':
+							return 'none';
+						case 'options':
+							return { ...options, response: { response: responseOptions } };
+						case 'options.pagination.pagination':
+							return pagination ?? fallback;
+						case 'options.response.response.responseFormat':
+							return responseOptions.responseFormat ?? fallback;
+						case 'options.response.response.fullResponse':
+							return responseOptions.fullResponse ?? fallback;
+						default:
+							return fallback;
+					}
+				},
+			);
+			(executeFunctions.helpers.prepareBinaryData as Mock).mockResolvedValue({
+				data: '',
+				mimeType: 'image/png',
+			});
+		};
+
+		it.each([false, true])(
+			'should not keep the response stream in the context for file format (fullResponse: %s)',
+			async (fullResponse) => {
+				setup({ responseFormat: 'file', fullResponse });
+				(executeFunctions.helpers.request as Mock).mockResolvedValue({
+					statusCode: 200,
+					statusMessage: 'OK',
+					headers: { 'content-type': 'image/png' },
+					body: createStreamWithRequestHeaders(),
+				});
+
+				await node.execute.call(executeFunctions);
+
+				expect(nodeContext.response).toEqual({
+					statusCode: 200,
+					statusMessage: 'OK',
+					headers: { 'content-type': 'image/png' },
+					body: expect.any(String),
+				});
+				expect(JSON.stringify(nodeContext)).not.toContain(REQUEST_HEADER);
+			},
+		);
+
+		it('should not keep the response stream in the context for an autodetected binary response', async () => {
+			setup({});
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				statusCode: 200,
+				headers: { 'content-type': 'image/png' },
+				body: createStreamWithRequestHeaders(),
+			});
+
+			await node.execute.call(executeFunctions);
+
+			expect(JSON.stringify(nodeContext)).not.toContain(REQUEST_HEADER);
+		});
+
+		it('should keep the resolved body in the context for an autodetected JSON response', async () => {
+			setup({});
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				statusCode: 200,
+				headers: { 'content-type': 'application/json' },
+				body: Buffer.from(JSON.stringify({ next: 'page-2' })),
+			});
+
+			await node.execute.call(executeFunctions);
+
+			expect(nodeContext.response).toMatchObject({
+				statusCode: 200,
+				headers: { 'content-type': 'application/json' },
+				body: { next: 'page-2' },
+			});
+		});
+
+		it('should keep only the first page in the context for paginated requests', async () => {
+			setup({ responseFormat: 'json' }, paginationOptions);
+			const pages = [
+				{ statusCode: 200, headers: { 'content-type': 'application/json' }, body: { next: 'p2' } },
+				{ statusCode: 200, headers: { 'content-type': 'application/json' }, body: { next: '' } },
+			];
+			(executeFunctions.helpers.requestWithAuthenticationPaginated as Mock).mockResolvedValue(
+				pages,
+			);
+
+			await node.execute.call(executeFunctions);
+
+			expect(Array.isArray(nodeContext.response)).toBe(false);
+			expect(nodeContext.response).toMatchObject(pages[0]);
+		});
+
+		it('should not keep the response stream in the context for paginated file requests', async () => {
+			setup({ responseFormat: 'file' }, paginationOptions);
+			(executeFunctions.helpers.requestWithAuthenticationPaginated as Mock).mockResolvedValue([
+				{
+					statusCode: 200,
+					headers: { 'content-type': 'image/png' },
+					body: createStreamWithRequestHeaders(),
+				},
+			]);
+
+			await node.execute.call(executeFunctions);
+
+			expect(nodeContext.response).toMatchObject({ statusCode: 200, body: expect.any(String) });
+			expect(JSON.stringify(nodeContext)).not.toContain(REQUEST_HEADER);
+		});
+
+		it('should not write to the context outside of manual runs', async () => {
+			setup({ responseFormat: 'file' });
+			(executeFunctions.getMode as Mock).mockReturnValue('trigger');
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				statusCode: 200,
+				headers: { 'content-type': 'image/png' },
+				body: createStreamWithRequestHeaders(),
+			});
+
+			await node.execute.call(executeFunctions);
+
+			expect(nodeContext).toEqual({});
+		});
+	});
+
+	describe('Raw request body', () => {
+		const REQUEST_HEADER = 'X-Custom-Header: custom-value';
+
+		// A response stream references its socket, and the socket references the raw request headers.
+		const createStream = (content: string) => {
+			const socket = new Socket();
+			Object.assign(socket, {
+				_httpMessage: { _header: `POST / HTTP/1.1\r\n${REQUEST_HEADER}\r\n` },
+			});
+			const message = new IncomingMessage(socket);
+			message.push(content);
+			message.push(null);
+			return message;
+		};
+
+		const paginationOptions = {
+			paginationMode: 'responseContainsNextURL',
+			nextURL: '={{ $response.body.next }}',
+			paginationCompleteWhen: 'responseIsEmpty',
+			statusCodesWhenComplete: '',
+			completeExpression: '',
+			limitPagesFetched: false,
+			maxRequests: 10,
+			requestInterval: 0,
+		};
+
+		beforeEach(() => {
+			Object.assign(executeFunctions.helpers, {
+				binaryToBuffer: vi.fn(async (stream: AsyncIterable<Buffer | string>) => {
+					const chunks: Buffer[] = [];
+					for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+					return Buffer.concat(chunks);
+				}),
+				detectBinaryEncoding: vi.fn(() => 'utf-8'),
+			});
+		});
+
+		const setupRawBody = (responseFormat?: string, fullResponse = false, pagination?: unknown) => {
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation(
+				(paramName: string, _itemIndex: number, fallback: unknown) => {
+					switch (paramName) {
+						case 'method':
+							return 'POST';
+						case 'url':
+							return baseUrl;
+						case 'authentication':
+							return 'none';
+						case 'sendBody':
+							return true;
+						case 'contentType':
+							return 'raw';
+						case 'rawContentType':
+							return 'application/json';
+						case 'body':
+							return '{"a":1}';
+						case 'options':
+							return { ...options, response: { response: { responseFormat, fullResponse } } };
+						case 'options.pagination.pagination':
+							return pagination ?? fallback;
+						case 'options.response.response.responseFormat':
+							return responseFormat ?? fallback;
+						case 'options.response.response.fullResponse':
+							return fullResponse;
+						default:
+							return fallback;
+					}
+				},
+			);
+		};
+
+		const mockResponse = (body: unknown, contentType = 'application/json') => {
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				statusCode: 200,
+				headers: { 'content-type': contentType },
+				body,
+			});
+		};
+
+		it.each(['json', 'text', undefined, 'file'])(
+			'should request a stream for the %s response format',
+			async (responseFormat) => {
+				setupRawBody(responseFormat);
+				mockResponse(createStream('{"a":1}'));
+				(executeFunctions.helpers.prepareBinaryData as Mock).mockResolvedValue({
+					data: '',
+					mimeType: 'application/json',
+				});
+
+				await node.execute.call(executeFunctions);
+
+				const requestOptions = (executeFunctions.helpers.request as Mock).mock.calls[0][0] as {
+					useStream?: boolean;
+				};
+				expect(requestOptions.useStream).toBe(true);
+			},
+		);
+
+		it('should return the parsed body for the json response format', async () => {
+			setupRawBody('json');
+			mockResponse(createStream('{"a":1}'));
+
+			const result = await node.execute.call(executeFunctions);
+
+			expect(result).toEqual([[{ json: { a: 1 }, pairedItem: { item: 0 } }]]);
+			expect(JSON.stringify(result)).not.toContain(REQUEST_HEADER);
+		});
+
+		it('should return the parsed body for the json response format with full response', async () => {
+			setupRawBody('json', true);
+			mockResponse(createStream('{"a":1}'));
+
+			const result = await node.execute.call(executeFunctions);
+
+			expect(result[0][0].json.body).toEqual({ a: 1 });
+			expect(JSON.stringify(result)).not.toContain(REQUEST_HEADER);
+		});
+
+		it('should return an empty object for the json response format with an empty body', async () => {
+			setupRawBody('json');
+			mockResponse(createStream(''));
+
+			const result = await node.execute.call(executeFunctions);
+
+			expect(result).toEqual([[{ json: {}, pairedItem: { item: 0 } }]]);
+		});
+
+		it('should throw for the json response format with a body that is not json', async () => {
+			setupRawBody('json');
+			mockResponse(createStream('not json'));
+
+			await expect(node.execute.call(executeFunctions)).rejects.toThrow('not valid JSON');
+		});
+
+		it.each([false, true])(
+			'should return the body as text for the text response format (fullResponse: %s)',
+			async (fullResponse) => {
+				setupRawBody('text', fullResponse);
+				mockResponse(createStream('{"a":1}'));
+
+				const result = await node.execute.call(executeFunctions);
+
+				expect(result[0][0].json.data).toBe('{"a":1}');
+				expect(JSON.stringify(result)).not.toContain(REQUEST_HEADER);
+			},
+		);
+
+		it('should keep the body that the pagination helper resolved', async () => {
+			setupRawBody('json', false, paginationOptions);
+			(executeFunctions.helpers.requestWithAuthenticationPaginated as Mock).mockResolvedValue([
+				{
+					statusCode: 200,
+					headers: { 'content-type': 'application/json' },
+					body: { a: 1 },
+					__bodyResolved: true,
+				},
+			]);
+
+			const result = await node.execute.call(executeFunctions);
+
+			expect(result).toEqual([[{ json: { a: 1 }, pairedItem: { item: 0 } }]]);
+			const paginatedRequestOptions = (
+				executeFunctions.helpers.requestWithAuthenticationPaginated as Mock
+			).mock.calls[0][0] as { useStream?: boolean };
+			expect(paginatedRequestOptions.useStream).toBe(true);
+			expect(executeFunctions.helpers.binaryToBuffer).not.toHaveBeenCalled();
+		});
+
+		it('should keep the response stream for the file response format', async () => {
+			setupRawBody('file');
+			const stream = createStream('data');
+			mockResponse(stream, 'image/png');
+			(executeFunctions.helpers.prepareBinaryData as Mock).mockResolvedValue({
+				data: '',
+				mimeType: 'image/png',
+			});
+
+			await node.execute.call(executeFunctions);
+
+			expect(executeFunctions.helpers.prepareBinaryData).toHaveBeenCalledWith(
+				stream,
+				undefined,
+				'image/png',
+			);
+			expect(executeFunctions.helpers.binaryToBuffer).not.toHaveBeenCalled();
 		});
 	});
 });

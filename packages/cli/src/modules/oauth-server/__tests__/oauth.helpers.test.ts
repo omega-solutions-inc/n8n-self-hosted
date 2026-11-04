@@ -184,4 +184,72 @@ describe('OAuthHelpers', () => {
 			expect(new URL(result).searchParams.get('iss')).toBe(issuer);
 		});
 	});
+
+	describe('setIssuerParam', () => {
+		it('should set iss on an absolute URL without one', () => {
+			const result = OAuthHelpers.setIssuerParam('https://example.com/callback', issuer);
+
+			expect(new URL(result).searchParams.get('iss')).toBe(issuer);
+		});
+
+		it('should preserve existing query parameters', () => {
+			const result = OAuthHelpers.setIssuerParam(
+				'https://example.com/callback?error=invalid_request&state=state-xyz',
+				issuer,
+			);
+
+			const url = new URL(result);
+			expect(url.searchParams.get('error')).toBe('invalid_request');
+			expect(url.searchParams.get('state')).toBe('state-xyz');
+			expect(url.searchParams.get('iss')).toBe(issuer);
+		});
+
+		it('should replace a pre-existing iss parameter with the server issuer', () => {
+			const result = OAuthHelpers.setIssuerParam(
+				'https://example.com/callback?iss=https%3A%2F%2Fother.example.com',
+				issuer,
+			);
+
+			expect(new URL(result).searchParams.get('iss')).toBe(issuer);
+			expect(new URL(result).searchParams.getAll('iss')).toHaveLength(1);
+		});
+
+		it('should return relative URLs unchanged', () => {
+			expect(OAuthHelpers.setIssuerParam('/oauth/consent', issuer)).toBe('/oauth/consent');
+		});
+	});
+
+	describe('basicAuthClientId', () => {
+		const basicHeader = (credentials: string) =>
+			`Basic ${Buffer.from(credentials, 'utf8').toString('base64')}`;
+
+		it('should return the client id from the username half', () => {
+			expect(OAuthHelpers.basicAuthClientId(basicHeader('client-123:s3cret'))).toBe('client-123');
+		});
+
+		it('should not return the secret, even when the secret holds a colon', () => {
+			const result = OAuthHelpers.basicAuthClientId(basicHeader('client-123:s3:cret'));
+
+			expect(result).toBe('client-123');
+			expect(result).not.toContain('s3');
+		});
+
+		it('should form-decode the client id', () => {
+			expect(OAuthHelpers.basicAuthClientId(basicHeader('client%20123:secret'))).toBe('client 123');
+		});
+
+		it('should return an id that is not form-encoded as sent', () => {
+			expect(OAuthHelpers.basicAuthClientId(basicHeader('client%id:secret'))).toBe('client%id');
+		});
+
+		it.each([
+			undefined,
+			'',
+			'Bearer abc123',
+			'Basic',
+			'Basic ' + Buffer.from(':s').toString('base64'),
+		])('should return undefined for the header %s', (header) => {
+			expect(OAuthHelpers.basicAuthClientId(header)).toBeUndefined();
+		});
+	});
 });

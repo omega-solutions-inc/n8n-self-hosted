@@ -4,47 +4,51 @@ import { createZodSchemaFromArgs, extractFromAIParameters } from '@n8n/ai-utilit
 import type { AgentJsonToolConfig } from '@n8n/api-types';
 import { Container } from '@n8n/di';
 import type { JSONSchema7 } from 'json-schema';
-import type { IDataObject, INodeParameters } from 'n8n-workflow';
-import { isToolType, nodeNameToToolName } from 'n8n-workflow';
+import type {
+	IDataObject,
+	INodeCredentialsDetails,
+	INodeParameters,
+	IWorkflowExecuteAdditionalData,
+} from 'n8n-workflow';
+import { nodeNameToToolName } from 'n8n-workflow';
 import { z } from 'zod';
 
-import type { EphemeralNodeExecutor } from '@/node-execution';
+import { resolveToolNodeType, type EphemeralNodeExecutor } from '@/node-execution';
 import { NodeTypes } from '@/node-types';
+
+import type { InstrumentToolAdditionalData } from '../evaluation/agent-evaluation.contracts';
+import { toPolicyRefusalResult } from './policy-refusal';
 
 type NodeToolInputSchema = JSONSchema7 | z.ZodType;
 
 export interface NodeToolFactoryContext {
 	executor: EphemeralNodeExecutor;
 	projectId: string;
+	/** Eval-only additionalData decoration — absent on every production path. */
+	instrumentToolAdditionalData?: InstrumentToolAdditionalData;
 }
 
 /**
  * Shape the config's credential map for the executor. Both introspection (at
  * tool-registration time) and invocation (at LLM-call time) need to hand the
- * executor a `Record<slot, { id, name }>`, and both want to drop entries whose
- * credential hasn't been persisted yet (no id).
+ * executor an `INodeCredentialsDetails` map, and both drop entries whose
+ * credential hasn't been persisted yet (no id). n8n Connect managed slots have
+ * no stored id — the executor mints them per execution — so they are carried
+ * through by their `__aiGatewayManaged` flag rather than by id.
  */
 function toExecutorCredentials(
 	credentials: Extract<AgentJsonToolConfig, { type: 'node' }>['node']['credentials'],
-): Record<string, { id: string; name: string }> | undefined {
+): Record<string, INodeCredentialsDetails> | undefined {
 	if (!credentials) return undefined;
-	const out: Record<string, { id: string; name: string }> = {};
+	const out: Record<string, INodeCredentialsDetails> = {};
 	for (const [slot, ref] of Object.entries(credentials)) {
-		if (ref.id) out[slot] = { id: ref.id, name: ref.name };
+		if ('__aiGatewayManaged' in ref) {
+			out[slot] = { id: null, name: ref.name, __aiGatewayManaged: true };
+		} else if (ref.id) {
+			out[slot] = { id: ref.id, name: ref.name };
+		}
 	}
 	return Object.keys(out).length > 0 ? out : undefined;
-}
-
-function resolveToolNodeType(nodeType: string, nodeTypeVersion: number): string {
-	if (isToolType(nodeType)) return nodeType;
-
-	const toolNodeType = `${nodeType}Tool`;
-	try {
-		Container.get(NodeTypes).getByNameAndVersion(toolNodeType, nodeTypeVersion);
-		return toolNodeType;
-	} catch {
-		return nodeType;
-	}
 }
 
 function createNativeStringToolInputSchema(description: string): z.ZodType {
@@ -136,6 +140,18 @@ export async function resolveNodeTool(
 	const sanitizedName = nodeNameToToolName(toolSchema.name);
 	const nodeType = resolveToolNodeType(toolSchema.node.nodeType, toolSchema.node.nodeTypeVersion);
 
+	// When instrumented (eval runs), the ephemeral node is named after the tool
+	// so hint lookup and request attribution key on the same identifier the
+	// model calls.
+	const instrument = ctx.instrumentToolAdditionalData;
+	const instrumentedExecution = instrument
+		? {
+				nodeName: sanitizedName,
+				configureAdditionalData: (additionalData: IWorkflowExecuteAdditionalData) =>
+					instrument(additionalData, { toolName: sanitizedName, toolKind: 'node' }),
+			}
+		: {};
+
 	const built = new Tool(sanitizedName)
 		.description(toolSchema.description ?? `Execute the ${nodeType} node`)
 		.input(await resolveInputSchema(toolSchema, ctx))
@@ -147,7 +163,15 @@ export async function resolveNodeTool(
 				credentialDetails: toExecutorCredentials(toolSchema.node.credentials),
 				inputData: [{ json: input as IDataObject }],
 				projectId: ctx.projectId,
+				...instrumentedExecution,
 			});
+			// A refusal is returned, not thrown: thrown errors reach the chat as plain text.
+			if (result.status === 'error' && result.violations) {
+				return toPolicyRefusalResult(
+					result.error ?? result.violations[0].message,
+					result.violations,
+				);
+			}
 			// Throw on the executor's structured error so the agent runtime
 			// flags the tool-result with `isError: true` and the recorder
 			// marks the timeline entry as a failed call. Returning the error
@@ -171,7 +195,7 @@ export async function resolveNodeTool(
 			// can render the real node config alongside the LLM's runtime
 			// input. Without this the synthetic execution viewer shows empty
 			// parameters and input/output read as the same thing.
-			nodeParameters: toolSchema.node.nodeParameters as INodeParameters,
+			nodeParameters: toolSchema.node.nodeParameters,
 		},
 	};
 }

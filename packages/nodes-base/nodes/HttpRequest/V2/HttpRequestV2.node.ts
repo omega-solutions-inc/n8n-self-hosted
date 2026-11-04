@@ -13,11 +13,13 @@ import type {
 import {
 	NodeApiError,
 	NodeOperationError,
-	sleep,
 	removeCircularRefs,
 	NodeConnectionTypes,
+	sleepUnlessExecutionCancelled,
 } from 'n8n-workflow';
 import type { Readable } from 'stream';
+
+import { applyTemplatedAuth } from '@utils/templated-auth';
 
 import type { IAuthDataSanitizeKeys } from '../GenericFunctions';
 import {
@@ -647,6 +649,7 @@ export class HttpRequestV2 implements INodeType {
 		let httpDigestAuth;
 		let httpHeaderAuth;
 		let httpQueryAuth;
+		let httpTemplatedCustomAuth;
 		let oAuth1Api;
 		let oAuth2Api;
 		let nodeCredentialType;
@@ -674,6 +677,10 @@ export class HttpRequestV2 implements INodeType {
 				try {
 					httpQueryAuth = await this.getCredentials('httpQueryAuth');
 				} catch {}
+			} else if (genericAuthType === 'httpTemplatedCustomAuth') {
+				try {
+					httpTemplatedCustomAuth = await this.getCredentials('httpTemplatedCustomAuth');
+				} catch {}
 			} else if (genericAuthType === 'oAuth1Api') {
 				try {
 					oAuth1Api = await this.getCredentials('oAuth1Api');
@@ -697,6 +704,7 @@ export class HttpRequestV2 implements INodeType {
 			httpDigestAuth,
 			httpHeaderAuth,
 			httpQueryAuth,
+			httpTemplatedCustomAuth,
 			oAuth1Api,
 			oAuth2Api,
 		]) {
@@ -786,7 +794,7 @@ export class HttpRequestV2 implements INodeType {
 				const batchSize: number =
 					(options.batchSize as number) > 0 ? (options.batchSize as number) : 1;
 				if (itemIndex % batchSize === 0) {
-					await sleep(options.batchInterval as number);
+					await sleepUnlessExecutionCancelled(this, options.batchInterval as number);
 				}
 			}
 
@@ -798,6 +806,7 @@ export class HttpRequestV2 implements INodeType {
 				uri: url,
 				gzip: true,
 				rejectUnauthorized: !this.getNodeParameter('allowUnauthorizedCerts', itemIndex, false),
+				sendCredentialsOnCrossOriginRedirect: true,
 				allowedDomains,
 			};
 
@@ -997,8 +1006,8 @@ export class HttpRequestV2 implements INodeType {
 					}
 				}
 			} else if (options.bodyContentType === 'raw') {
+				// Read the body as text. It is parsed below, and nothing here consumes a stream.
 				requestOptions.json = false;
-				requestOptions.useStream = true;
 			} else {
 				requestOptions.json = true;
 			}
@@ -1044,6 +1053,12 @@ export class HttpRequestV2 implements INodeType {
 					sendImmediately: false,
 				};
 				authDataKeys.auth = ['pass'];
+			}
+			if (httpTemplatedCustomAuth !== undefined) {
+				const templatedAuth = applyTemplatedAuth(httpTemplatedCustomAuth, requestOptions);
+				if (templatedAuth.headers) authDataKeys.headers = Object.keys(templatedAuth.headers);
+				if (templatedAuth.body) authDataKeys.body = Object.keys(templatedAuth.body);
+				if (templatedAuth.qs) authDataKeys.qs = Object.keys(templatedAuth.qs);
 			}
 
 			if (requestOptions.headers!.accept === undefined) {

@@ -9,7 +9,7 @@ import { waitingNodeTooltip } from '@/features/execution/executions/executions.u
 import { useExecutionRedaction } from '@/features/execution/executions/composables/useExecutionRedaction';
 import { computed, inject, ref } from 'vue';
 import { I18nT } from 'vue-i18n';
-import { PopOutWindowKey } from '@/app/constants';
+import { PopOutWindowKey } from '@n8n/composables/injectionKeys';
 import { WORKFLOW_SETTINGS_MODAL_KEY } from '@/app/constants/modals';
 import { useUIStore } from '@/app/stores/ui.store';
 import { isSubNodeLog } from '../logs.utils';
@@ -47,7 +47,14 @@ const emit = defineEmits<{
 const locale = useI18n();
 const ndvStore = injectNDVStore();
 const uiStore = useUIStore();
-const { canReveal, isDynamicCredentials, revealData } = useExecutionRedaction();
+const {
+	canReveal,
+	isDynamicCredentials,
+	isSubWorkflowRedaction,
+	revealData,
+	credentialToShare,
+	openCredentialSharing,
+} = useExecutionRedaction();
 
 const popOutWindow = inject(PopOutWindowKey, ref<Window | undefined>());
 
@@ -156,7 +163,10 @@ function handleChangeDisplayMode(value: IRunDataDisplayMode) {
 					)
 				"
 				:is-dynamic-credentials="isDynamicCredentials"
+				:is-sub-workflow-redaction="isSubWorkflowRedaction"
 				:can-reveal="canReveal"
+				:credential-to-share="credentialToShare"
+				@share-credential="openCredentialSharing"
 				@open-settings="uiStore.openModal(WORKFLOW_SETTINGS_MODAL_KEY)"
 				@reveal="revealData"
 			/>
